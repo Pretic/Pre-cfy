@@ -6,7 +6,7 @@
 
 ---
 
-## 本仓库说明（PreNet 自用二改）
+## 本仓库说明（Pretic 自用二改）
 
 本仓库基于原作者 [byJoey/cfy](https://github.com/byJoey/cfy) 二次修改，保留原作者信息、联系方式和免责声明。感谢 byJoey 提供的 Cloudflare 优选节点生成脚本基础。
 
