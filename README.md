@@ -62,7 +62,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/Pretic/Pre-cfy/main/cfy.sh)
 apt update && apt install -y jq curl coreutils grep sed sudo
 ```
 
-## 一键安装与运行
+## 一键新装与运行
 
 请复制并执行以下命令。它会自动下载脚本，并触发脚本的自我安装程序。首次运行即完成安装。
 
@@ -86,7 +86,7 @@ CFY_NAME_PREFIX=PreNet cfy
 
 ## 更新与卸载
 
-* **更新脚本**: 重新运行一次上面的“一键安装”命令即可覆盖更新。
+* **更新脚本**: 重新运行一次下面命令即可覆盖 `/usr/local/bin/cfy`，不会修改 sing-box 已有节点。
     ```bash
   bash <(curl -Ls https://raw.githubusercontent.com/Pretic/Pre-cfy/main/cfy.sh)
     ```
