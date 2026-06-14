@@ -86,9 +86,9 @@ CFY_NAME_PREFIX=PreNet cfy
 
 ## 更新与卸载
 
-* **更新脚本**: 重新运行一次下面命令即可覆盖 `/usr/local/bin/cfy`，不会修改 sing-box 已有节点。
+* **更新脚本**: 运行下面命令即可覆盖 `/usr/local/bin/cfy`，不会进入优选生成流程，也不会修改 sing-box 已有节点或最近一次优选结果。
     ```bash
-  bash <(curl -Ls https://raw.githubusercontent.com/Pretic/Pre-cfy/main/cfy.sh)
+  bash <(curl -Ls https://raw.githubusercontent.com/Pretic/Pre-cfy/main/cfy.sh) --update
     ```
 
 * **卸载脚本**: 只需删除安装好的文件即可。
