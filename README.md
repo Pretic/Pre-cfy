@@ -6,7 +6,7 @@
 
 ---
 
-## 本仓库说明（Pretic 自用二改）
+## 本仓库说明（PreNet 自用二改）
 
 本仓库基于原作者 [byJoey/cfy](https://github.com/byJoey/cfy) 二次修改，保留原作者信息、联系方式和免责声明。感谢 byJoey 提供的 Cloudflare 优选节点生成脚本基础。
 
@@ -17,6 +17,7 @@
 * 兼容优选入口为域名、IPv4、IPv6、`host:port`、`[IPv6]:port` 等格式。
 * 保留旧 VMess 模板兼容逻辑，但仅作为找不到 VLESS 模板时的兜底。
 * 修正 IPv6 优选源，并从 Cloudflare 官方 CIDR 随机生成可用 IPv4 地址。
+* 最近一次生成的优选节点会保存到 `/etc/sing-box/cfy-url.txt`，后续可用 `cfy -c` 再次查看。
 
 自用一键命令：
 
@@ -71,6 +72,16 @@ bash <(curl -Ls https://raw.githubusercontent.com/Pretic/Pre-cfy/main/cfy.sh)
 安装成功后，您可以随时在终端的任何位置输入以下命令来启动脚本：
 ```bash
 cfy
+```
+
+查看最近一次生成的优选节点：
+```bash
+cfy -c
+```
+
+如需修改优选节点备注名前缀，可在运行时设置：
+```bash
+CFY_NAME_PREFIX=PreNet cfy
 ```
 
 ## 更新与卸载
