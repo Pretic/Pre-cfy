@@ -1,6 +1,10 @@
 #!/bin/bash
 
 INSTALL_PATH="/usr/local/bin/cfy"
+URL_FILE="/etc/sing-box/url.txt"
+RESULT_FILE="/etc/sing-box/cfy-url.txt"
+SUB_FILE="/etc/sing-box/cfy-sub.txt"
+RESULT_DIR="/etc/sing-box/cfy-results"
 
 if [ "$0" != "$INSTALL_PATH" ]; then
     echo "正在安装 [cfy 节点优选生成器]..."
@@ -34,7 +38,7 @@ if [ "$0" != "$INSTALL_PATH" ]; then
         echo "✅ 安装成功! 您现在可以随时随地运行 'cfy' 命令。"
         echo "---"
         echo "首次运行..."
-        exec "$INSTALL_PATH"
+        exec "$INSTALL_PATH" "$@"
     else
         echo "❌ 安装后赋权失败, 请检查权限。"
         exit 1
@@ -48,6 +52,48 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 RED='\033[0;31m'
 NC='\033[0m'
+declare -a generated_urls
+
+show_help() {
+    echo "用法: cfy [参数]"
+    echo "  无参数        生成 Cloudflare 优选节点"
+    echo "  -c, --check   查看最近一次生成的优选节点"
+    echo "  -h, --help    显示帮助"
+}
+
+show_saved_results() {
+    if [ ! -s "$RESULT_FILE" ]; then
+        echo -e "${YELLOW}尚未找到已保存的优选节点，请先运行 cfy 生成一次。${NC}"
+        return 1
+    fi
+
+    echo -e "${GREEN}=== 最近一次优选节点 ===${NC}"
+    cat "$RESULT_FILE"
+    echo ""
+    [ -s "$SUB_FILE" ] && echo -e "${GREEN}Base64订阅文件: ${SUB_FILE}${NC}"
+    [ -d "$RESULT_DIR" ] && echo -e "${GREEN}历史结果目录: ${RESULT_DIR}${NC}"
+}
+
+write_base64_file() {
+    if base64 -w0 "$RESULT_FILE" > "$SUB_FILE" 2>/dev/null; then
+        return 0
+    fi
+    base64 "$RESULT_FILE" | tr -d '\n\r' > "$SUB_FILE"
+}
+
+save_generated_urls() {
+    [ ${#generated_urls[@]} -eq 0 ] && return 0
+
+    mkdir -p "$(dirname "$RESULT_FILE")" "$RESULT_DIR"
+    printf '%s\n' "${generated_urls[@]}" > "$RESULT_FILE"
+    write_base64_file
+
+    local history_file="${RESULT_DIR}/$(date +%Y%m%d-%H%M%S).txt"
+    cp "$RESULT_FILE" "$history_file" 2>/dev/null || true
+
+    echo -e "${GREEN}已保存最近一次优选结果: ${RESULT_FILE}${NC}"
+    echo -e "${GREEN}后续可运行 cfy -c 再次查看。${NC}"
+}
 
 check_deps() {
     for cmd in jq curl base64 grep sed mktemp shuf; do
@@ -242,8 +288,9 @@ select_vmess_template() {
 }
 
 main() {
-    local url_file="/etc/sing-box/url.txt"
+    local url_file="$URL_FILE"
     declare -a valid_urls valid_ps_names valid_types
+    generated_urls=()
     
     echo -e "${GREEN}=================================================="
     echo -e " 节点优选生成器 (cfy)"
@@ -346,28 +393,48 @@ main() {
     if $use_optimized_ips; then
         for ((i=0; i<$num_to_generate; i++)); do
             local current_ip=${ip_list[$i]}; local isp_name=${isp_list[$i]}
-            local new_ps="${original_ps}-优选${isp_name}"
+            local name_prefix="${CFY_NAME_PREFIX:-$original_ps}"
+            local new_ps="${name_prefix}-优选${isp_name}"
+            local generated_url
             if [ "$selected_type" = "vless" ]; then
-                update_vless_url "$selected_url" "$current_ip" "$new_ps"
+                generated_url=$(update_vless_url "$selected_url" "$current_ip" "$new_ps")
             else
-                update_vmess_url "$original_json" "$current_ip" "$new_ps"
+                generated_url=$(update_vmess_url "$original_json" "$current_ip" "$new_ps")
             fi
+            echo "$generated_url"
+            generated_urls+=("$generated_url")
         done
     else
         for ((i=0; i<$num_to_generate; i++)); do
             local random_ip_range=${ip_list[$((RANDOM % ${#ip_list[@]}))]}
             local ip_from_range
             ip_from_range=$(cidr_to_usable_ip "$random_ip_range")
-            local new_ps="${original_ps}-CF$((i+1))"
+            local name_prefix="${CFY_NAME_PREFIX:-$original_ps}"
+            local new_ps="${name_prefix}-CF$((i+1))"
+            local generated_url
             if [ "$selected_type" = "vless" ]; then
-                update_vless_url "$selected_url" "$ip_from_range" "$new_ps"
+                generated_url=$(update_vless_url "$selected_url" "$ip_from_range" "$new_ps")
             else
-                update_vmess_url "$original_json" "$ip_from_range" "$new_ps"
+                generated_url=$(update_vmess_url "$original_json" "$ip_from_range" "$new_ps")
             fi
+            echo "$generated_url"
+            generated_urls+=("$generated_url")
         done
     fi
+    save_generated_urls
     echo "---"; echo -e "${GREEN}共 ${num_to_generate} 个链接已生成完毕.${NC}"
 }
+
+case "$1" in
+    -c|--check|--show)
+        show_saved_results
+        exit $?
+        ;;
+    -h|--help)
+        show_help
+        exit 0
+        ;;
+esac
 
 check_deps
 main
