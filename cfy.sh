@@ -58,7 +58,13 @@ show_help() {
     echo "用法: cfy [参数]"
     echo "  无参数        生成 Cloudflare 优选节点"
     echo "  -c, --check   查看最近一次生成的优选节点"
+    echo "      --update  更新 cfy 脚本后退出"
     echo "  -h, --help    显示帮助"
+}
+
+show_update_done() {
+    echo -e "${GREEN}cfy 已更新到 $INSTALL_PATH。${NC}"
+    echo -e "${GREEN}更新命令不会修改 sing-box 已有节点或最近一次优选结果。${NC}"
 }
 
 show_saved_results() {
@@ -432,6 +438,10 @@ case "$1" in
         ;;
     -h|--help)
         show_help
+        exit 0
+        ;;
+    --update|--upgrade)
+        show_update_done
         exit 0
         ;;
 esac
