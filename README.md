@@ -23,12 +23,12 @@
 
 ### cfy 新装
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/Pretic/Pre-cfy/main/cfy.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/Pre-cfy/main/cfy.sh)
 ```
 
 ### cfy 更新
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/Pretic/Pre-cfy/main/cfy.sh) --update
+bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/Pre-cfy/main/cfy.sh) --update
 ```
 
 ### 查看最近一次优选结果
@@ -38,6 +38,7 @@ cfy -c
 
 * 更新命令只覆盖 `/usr/local/bin/cfy`，不会进入优选生成流程，也不会修改 sing-box 已有节点或最近一次优选结果。
 * 首次使用请执行新装命令；已经安装过且只想同步仓库脚本时，再执行更新命令。
+* 本仓库命令统一使用 `curl -fsSL`，下载失败时会显示错误，避免 `curl -Ls` 失败后 Bash 静默执行空脚本。
 
 ---
 
@@ -81,7 +82,7 @@ apt update && apt install -y jq curl coreutils grep sed sudo
 请复制并执行以下命令。它会自动下载脚本，并触发脚本的自我安装程序。首次运行即完成安装。
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/Pretic/Pre-cfy/main/cfy.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/Pre-cfy/main/cfy.sh)
 ```
 安装成功后，您可以随时在终端的任何位置输入以下命令来启动脚本：
 ```bash
