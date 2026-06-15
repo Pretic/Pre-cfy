@@ -19,11 +19,25 @@
 * 修正 IPv6 优选源，并从 Cloudflare 官方 CIDR 随机生成可用 IPv4 地址。
 * 最近一次生成的优选节点会保存到 `/etc/sing-box/cfy-url.txt`，后续可用 `cfy -c` 再次查看。
 
-自用一键命令：
+## 命令速查
 
+### cfy 新装
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/Pretic/Pre-cfy/main/cfy.sh)
 ```
+
+### cfy 更新
+```bash
+bash <(curl -Ls https://raw.githubusercontent.com/Pretic/Pre-cfy/main/cfy.sh) --update
+```
+
+### 查看最近一次优选结果
+```bash
+cfy -c
+```
+
+* 更新命令只覆盖 `/usr/local/bin/cfy`，不会进入优选生成流程，也不会修改 sing-box 已有节点或最近一次优选结果。
+* 首次使用请执行新装命令；已经安装过且只想同步仓库脚本时，再执行更新命令。
 
 ---
 
@@ -86,10 +100,7 @@ CFY_NAME_PREFIX=PreNet cfy
 
 ## 更新与卸载
 
-* **更新脚本**: 运行下面命令即可覆盖 `/usr/local/bin/cfy`，不会进入优选生成流程，也不会修改 sing-box 已有节点或最近一次优选结果。
-    ```bash
-  bash <(curl -Ls https://raw.githubusercontent.com/Pretic/Pre-cfy/main/cfy.sh) --update
-    ```
+* **更新脚本**: 使用上方“命令速查”里的 `cfy 更新` 命令即可覆盖 `/usr/local/bin/cfy`，不会进入优选生成流程，也不会修改 sing-box 已有节点或最近一次优选结果。
 
 * **卸载脚本**: 只需删除安装好的文件即可。
     ```bash
