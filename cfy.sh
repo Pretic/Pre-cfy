@@ -1,6 +1,7 @@
 #!/bin/bash
 
 INSTALL_PATH="/usr/local/bin/cfy"
+REMOTE_URL="https://raw.githubusercontent.com/Pretic/Pre-cfy/main/cfy.sh"
 URL_FILE="/etc/sing-box/url.txt"
 RESULT_FILE="/etc/sing-box/cfy-url.txt"
 SUB_FILE="/etc/sing-box/cfy-sub.txt"
@@ -65,6 +66,44 @@ show_help() {
 show_update_done() {
     echo -e "${GREEN}cfy 已更新到 $INSTALL_PATH。${NC}"
     echo -e "${GREEN}更新命令不会修改 sing-box 已有节点或最近一次优选结果。${NC}"
+}
+
+update_self() {
+    if [ "$(id -u)" -ne 0 ]; then
+        echo -e "${RED}错误: 更新需要管理员权限，请使用 root 或 sudo 运行。${NC}"
+        exit 1
+    fi
+
+    if ! command -v curl >/dev/null 2>&1; then
+        echo -e "${RED}错误: 未找到 curl，无法从远端更新 cfy。${NC}"
+        exit 1
+    fi
+
+    local tmp_file
+    tmp_file="$(mktemp)"
+    echo -e "${YELLOW}正在从 GitHub 下载最新 cfy 脚本...${NC}"
+
+    if ! curl -fsSL "$REMOTE_URL" -o "$tmp_file"; then
+        rm -f "$tmp_file"
+        echo -e "${RED}下载失败: 无法访问 $REMOTE_URL${NC}"
+        echo -e "${YELLOW}请先检查本机是否能访问 raw.githubusercontent.com。${NC}"
+        exit 1
+    fi
+
+    if ! grep -q 'INSTALL_PATH="/usr/local/bin/cfy"' "$tmp_file"; then
+        rm -f "$tmp_file"
+        echo -e "${RED}下载内容校验失败，未覆盖本地 cfy。${NC}"
+        exit 1
+    fi
+
+    if ! install -m 755 "$tmp_file" "$INSTALL_PATH"; then
+        rm -f "$tmp_file"
+        echo -e "${RED}写入 $INSTALL_PATH 失败。${NC}"
+        exit 1
+    fi
+
+    rm -f "$tmp_file"
+    show_update_done
 }
 
 show_saved_results() {
@@ -441,7 +480,7 @@ case "$1" in
         exit 0
         ;;
     --update|--upgrade)
-        show_update_done
+        update_self
         exit 0
         ;;
 esac
