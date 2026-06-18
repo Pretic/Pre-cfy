@@ -109,6 +109,10 @@ update_self() {
 show_saved_results() {
     if [ ! -s "$RESULT_FILE" ]; then
         echo -e "${YELLOW}尚未找到已保存的优选节点，请先运行 cfy 生成一次。${NC}"
+        if show_source_templates; then
+            echo -e "${YELLOW}以上是 Sing-box 已创建的 VLESS-WS-TLS-Argo 模板节点，运行 cfy 后会生成优选节点并保存。${NC}"
+            return 0
+        fi
         return 1
     fi
 
@@ -191,6 +195,62 @@ get_vless_ps() {
         ps="vless-ws-tls-argo"
     fi
     echo "$ps"
+}
+
+url_decode() {
+    local value="${1//+/ }"
+    printf '%b' "${value//%/\\x}"
+}
+
+get_vless_query_param() {
+    local url="$1"
+    local key="$2"
+    local query pair param_name param_value
+
+    [[ "$url" == *\?* ]] || return 1
+    query="${url#*\?}"
+    query="${query%%#*}"
+
+    IFS='&' read -ra query_pairs <<< "$query"
+    for pair in "${query_pairs[@]}"; do
+        param_name="${pair%%=*}"
+        param_value="${pair#*=}"
+        if [ "$param_name" = "$key" ]; then
+            url_decode "$param_value"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+is_vless_ws_tls_argo() {
+    local url="$1"
+    local security transport path
+
+    [[ "$url" == vless://* ]] || return 1
+    security="$(get_vless_query_param "$url" "security")"
+    transport="$(get_vless_query_param "$url" "type")"
+    path="$(get_vless_query_param "$url" "path")"
+
+    [ "$security" = "tls" ] && [ "$transport" = "ws" ] && [ "$path" = "/vless-argo" ]
+}
+
+show_source_templates() {
+    local found=0 line
+
+    [ -s "$URL_FILE" ] || return 1
+    echo -e "${GREEN}=== Sing-box 已创建的 VLESS-WS-TLS-Argo 模板节点 ===${NC}"
+
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        if is_vless_ws_tls_argo "$line"; then
+            echo "$line"
+            found=1
+        fi
+    done < "$URL_FILE"
+
+    [ "$found" -eq 1 ]
 }
 
 extract_vless_port() {
@@ -305,9 +365,7 @@ select_vless_template() {
     local url ps
 
     for url in "${urls[@]}"; do
-        [[ "$url" == vless://* ]] || continue
-        [[ "$url" == *"security=tls"* && "$url" == *"type=ws"* ]] || continue
-        [[ "$url" == *"path=%2Fvless-argo"* || "$url" == *"path=/vless-argo"* ]] || continue
+        is_vless_ws_tls_argo "$url" || continue
         ps=$(get_vless_ps "$url")
         valid_urls+=("$url")
         valid_ps_names+=("$ps")
