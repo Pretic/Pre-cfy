@@ -39,6 +39,7 @@ cfy -c
 * 更新命令只覆盖 `/usr/local/bin/cfy`，不会进入优选生成流程，也不会修改 sing-box 已有节点或最近一次优选结果。
 * 首次使用请执行新装命令；已经安装过且只想同步仓库脚本时，再执行更新命令。
 * 本仓库命令统一使用 `curl -fsSL`，下载失败时会显示错误，避免 `curl -Ls` 失败后 Bash 静默执行空脚本。
+* `cfy -c` 优先显示 `/etc/sing-box/cfy-url.txt` 中最近一次优选结果；如果还没生成过优选节点，会尝试显示 `/etc/sing-box/url.txt` 中可作为模板的 VLESS-WS-TLS-Argo 节点。
 
 ---
 
