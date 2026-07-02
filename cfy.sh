@@ -5,6 +5,9 @@ REMOTE_URL="https://raw.githubusercontent.com/Pretic/Pre-cfy/main/cfy.sh"
 URL_FILE="/etc/sing-box/url.txt"
 RESULT_FILE="/etc/sing-box/cfy-url.txt"
 SUB_FILE="/etc/sing-box/cfy-sub.txt"
+COMBINED_URL_FILE="/etc/sing-box/all-url.txt"
+COMBINED_SUB_FILE="/etc/sing-box/all-sub.txt"
+SERVED_SUB_FILE="/etc/sing-box/sub.txt"
 RESULT_DIR="/etc/sing-box/cfy-results"
 
 if [ "$0" != "$INSTALL_PATH" ]; then
@@ -14,9 +17,9 @@ if [ "$0" != "$INSTALL_PATH" ]; then
         echo "错误: 安装需要管理员权限。请使用 'curl ... | sudo bash' 或 'sudo bash <(curl ...)' 命令来运行。"
         exit 1
     fi
-    
+
     echo "正在将脚本写入到 $INSTALL_PATH..."
-    
+
     # 智能判断执行模式
     if [[ "$(basename "$0")" == "bash" || "$(basename "$0")" == "sh" || "$(basename "$0")" == "-bash" ]]; then
         # 管道模式: curl ... | bash
@@ -120,14 +123,39 @@ show_saved_results() {
     cat "$RESULT_FILE"
     echo ""
     [ -s "$SUB_FILE" ] && echo -e "${GREEN}Base64订阅文件: ${SUB_FILE}${NC}"
+    [ -s "$COMBINED_SUB_FILE" ] && echo -e "${GREEN}综合订阅文件: ${COMBINED_SUB_FILE} -> ${SERVED_SUB_FILE}${NC}"
     [ -d "$RESULT_DIR" ] && echo -e "${GREEN}历史结果目录: ${RESULT_DIR}${NC}"
 }
 
 write_base64_file() {
-    if base64 -w0 "$RESULT_FILE" > "$SUB_FILE" 2>/dev/null; then
+    local source_file="${1:-$RESULT_FILE}"
+    local sub_file="${2:-$SUB_FILE}"
+
+    [ -s "$source_file" ] || { : > "$sub_file"; return 0; }
+    if base64 -w0 "$source_file" > "$sub_file" 2>/dev/null; then
         return 0
     fi
-    base64 "$RESULT_FILE" | tr -d '\n\r' > "$SUB_FILE"
+    base64 "$source_file" | tr -d '\n\r' > "$sub_file"
+}
+
+sync_combined_subscription() {
+    local tmp_file
+    tmp_file=$(mktemp)
+
+    [ -s "$URL_FILE" ] && sed '/^[[:space:]]*$/d' "$URL_FILE" > "$tmp_file"
+    if [ -s "$RESULT_FILE" ]; then
+        [ -s "$tmp_file" ] && printf '\n' >> "$tmp_file"
+        sed '/^[[:space:]]*$/d' "$RESULT_FILE" >> "$tmp_file"
+    fi
+
+    if [ -s "$tmp_file" ]; then
+        mv "$tmp_file" "$COMBINED_URL_FILE"
+        write_base64_file "$COMBINED_URL_FILE" "$COMBINED_SUB_FILE"
+        cp "$COMBINED_SUB_FILE" "$SERVED_SUB_FILE"
+        chmod 644 "$COMBINED_URL_FILE" "$COMBINED_SUB_FILE" "$SERVED_SUB_FILE" 2>/dev/null || true
+    else
+        rm -f "$tmp_file"
+    fi
 }
 
 save_generated_urls() {
@@ -136,11 +164,13 @@ save_generated_urls() {
     mkdir -p "$(dirname "$RESULT_FILE")" "$RESULT_DIR"
     printf '%s\n' "${generated_urls[@]}" > "$RESULT_FILE"
     write_base64_file
+    sync_combined_subscription
 
     local history_file="${RESULT_DIR}/$(date +%Y%m%d-%H%M%S).txt"
     cp "$RESULT_FILE" "$history_file" 2>/dev/null || true
 
     echo -e "${GREEN}已保存最近一次优选结果: ${RESULT_FILE}${NC}"
+    echo -e "${GREEN}已同步到综合订阅: ${SERVED_SUB_FILE}${NC}"
     echo -e "${GREEN}后续可运行 cfy -c 再次查看。${NC}"
 }
 
@@ -156,9 +186,9 @@ check_deps() {
 get_all_optimized_ips() {
     local url_v4="https://www.wetest.vip/page/cloudflare/address_v4.html"
     local url_v6="https://www.wetest.vip/page/cloudflare/address_v6.html"
-    
+
     echo -e "${YELLOW}正在合并获取所有优选 IP (IPv4 & IPv6)...${NC}"
-    
+
     local paired_data_file
     paired_data_file=$(mktemp)
     trap 'rm -f "$paired_data_file"' EXIT
@@ -394,7 +424,7 @@ main() {
     local url_file="$URL_FILE"
     declare -a valid_urls valid_ps_names valid_types
     generated_urls=()
-    
+
     echo -e "${GREEN}=================================================="
     echo -e " 节点优选生成器 (cfy)"
     echo -e " (适配老王的4合一sing-box)"
@@ -462,11 +492,11 @@ main() {
         original_ps=$(echo "$original_json" | jq -r .ps)
     fi
     echo -e "${GREEN}已选择: $original_ps${NC}"
-    
+
     echo -e "${YELLOW}请选择要使用的 IP 地址来源:${NC}"
     echo "  1) Cloudflare 官方 (手动优选)"
     echo "  2) 云优选  "
-    
+
     local ip_source_choice; local use_optimized_ips=false
     while true; do
         read -p "请输入选项编号 (1-2): " ip_source_choice
@@ -474,7 +504,7 @@ main() {
         elif [[ "$ip_source_choice" == "2" ]]; then use_optimized_ips=true; break;
         else echo -e "${RED}无效的输入, 请重试.${NC}"; fi
     done
-    
+
     declare -a ip_list isp_list; local num_to_generate=0
     if $use_optimized_ips; then
         get_all_optimized_ips || exit 1

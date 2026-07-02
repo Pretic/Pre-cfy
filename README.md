@@ -19,6 +19,13 @@
 * 修正 IPv6 优选源，并从 Cloudflare 官方 CIDR 随机生成可用 IPv4 地址。
 * 最近一次生成的优选节点会保存到 `/etc/sing-box/cfy-url.txt`，后续可用 `cfy -c` 再次查看。
 
+
+## 与 Sing-box 订阅的同步机制
+
+* cfy 生成的优选节点会保存到 `/etc/sing-box/cfy-url.txt`，对应 Base64 文件为 `/etc/sing-box/cfy-sub.txt`。
+* 每次成功生成后，cfy 会把 `/etc/sing-box/url.txt` 的基础节点和 `/etc/sing-box/cfy-url.txt` 的优选节点合并到 `/etc/sing-box/all-url.txt`。
+* 合并后的 Base64 订阅写入 `/etc/sing-box/all-sub.txt`，并同步覆盖 `/etc/sing-box/sub.txt`，因此原来的 Nginx 订阅地址会自动包含优选节点。
+* 如果还没有运行过 cfy，Sing-box 的订阅地址仍只包含基础节点，不会因为没有优选结果而失效。
 ## 命令速查
 
 ### cfy 新装
