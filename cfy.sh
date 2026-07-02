@@ -10,6 +10,71 @@ COMBINED_SUB_FILE="${COMBINED_SUB_FILE:-/etc/sing-box/all-sub.txt}"
 SERVED_SUB_FILE="${SERVED_SUB_FILE:-/etc/sing-box/sub.txt}"
 RESULT_DIR="${RESULT_DIR:-/etc/sing-box/cfy-results}"
 
+is_stdin_script() {
+    case "$(basename "$0")" in
+        bash|sh|-bash)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+is_process_substitution_script() {
+    [[ "$0" == /dev/fd/* || "$0" == /proc/*/fd/* ]]
+}
+
+install_from_remote() {
+    if ! command -v curl >/dev/null 2>&1; then
+        echo "错误: 未找到 curl，无法从远端安装 cfy。"
+        return 1
+    fi
+
+    local tmp_file
+    tmp_file="$(mktemp)"
+    echo "正在从 GitHub 下载最新 cfy 脚本..."
+
+    if ! curl -fsSL "$REMOTE_URL" -o "$tmp_file"; then
+        rm -f "$tmp_file"
+        echo "下载失败: 无法访问 $REMOTE_URL"
+        return 1
+    fi
+
+    if ! grep -q 'REMOTE_URL="https://raw.githubusercontent.com/Pretic/Pre-cfy/main/cfy.sh"' "$tmp_file"; then
+        rm -f "$tmp_file"
+        echo "下载内容校验失败，未覆盖本地 cfy。"
+        return 1
+    fi
+
+    if ! cp "$tmp_file" "$INSTALL_PATH"; then
+        rm -f "$tmp_file"
+        echo "❌ 写入脚本失败，请重试。"
+        return 1
+    fi
+
+    rm -f "$tmp_file"
+}
+
+finish_install() {
+    if ! chmod +x "$INSTALL_PATH"; then
+        echo "❌ 安装后赋权失败，请检查权限。"
+        exit 1
+    fi
+
+    echo "✅ 安装成功! 您现在可以随时随地运行 'cfy' 命令。"
+    case "${1:-}" in
+        --update|--upgrade)
+            echo "cfy updated at $INSTALL_PATH."
+            exit 0
+            ;;
+    esac
+
+    echo "---"
+    echo "首次运行..."
+    exec "$INSTALL_PATH" "$@"
+}
+
 if [ "$0" != "$INSTALL_PATH" ]; then
     echo "正在安装 [cfy 节点优选生成器]..."
 
@@ -20,36 +85,17 @@ if [ "$0" != "$INSTALL_PATH" ]; then
 
     echo "正在将脚本写入到 $INSTALL_PATH..."
 
-    # 智能判断执行模式
-    if [[ "$(basename "$0")" == "bash" || "$(basename "$0")" == "sh" || "$(basename "$0")" == "-bash" ]]; then
-        # 管道模式: curl ... | bash
-        # 脚本内容在标准输入 (fd/0)
-        if ! cat /proc/self/fd/0 > "$INSTALL_PATH"; then
-            echo "❌ 写入脚本失败 (管道模式)，请重试。"
-            exit 1
-        fi
+    if is_stdin_script || is_process_substitution_script; then
+        install_from_remote || exit 1
     else
-        # 文件模式: bash cfy.sh 或 bash <(curl ...)
-        # 脚本内容在 $0 所指向的文件路径
         if ! cp "$0" "$INSTALL_PATH"; then
-            echo "❌ 复制脚本失败 (文件模式)，请重试。"
+            echo "❌ 复制脚本失败，请重试。"
             exit 1
         fi
     fi
 
-    if [ $? -eq 0 ]; then
-        chmod +x "$INSTALL_PATH"
-        echo "✅ 安装成功! 您现在可以随时随地运行 'cfy' 命令。"
-        echo "---"
-        echo "首次运行..."
-        exec "$INSTALL_PATH" "$@"
-    else
-        echo "❌ 安装后赋权失败, 请检查权限。"
-        exit 1
-    fi
-    exit 0
+    finish_install "$@"
 fi
-
 # --- 主程序从这里开始 ---
 
 GREEN='\033[0;32m'
