@@ -2,13 +2,13 @@
 
 INSTALL_PATH="/usr/local/bin/cfy"
 REMOTE_URL="https://raw.githubusercontent.com/Pretic/Pre-cfy/main/cfy.sh"
-URL_FILE="/etc/sing-box/url.txt"
-RESULT_FILE="/etc/sing-box/cfy-url.txt"
-SUB_FILE="/etc/sing-box/cfy-sub.txt"
-COMBINED_URL_FILE="/etc/sing-box/all-url.txt"
-COMBINED_SUB_FILE="/etc/sing-box/all-sub.txt"
-SERVED_SUB_FILE="/etc/sing-box/sub.txt"
-RESULT_DIR="/etc/sing-box/cfy-results"
+URL_FILE="${URL_FILE:-/etc/sing-box/url.txt}"
+RESULT_FILE="${RESULT_FILE:-/etc/sing-box/cfy-url.txt}"
+SUB_FILE="${SUB_FILE:-/etc/sing-box/cfy-sub.txt}"
+COMBINED_URL_FILE="${COMBINED_URL_FILE:-/etc/sing-box/all-url.txt}"
+COMBINED_SUB_FILE="${COMBINED_SUB_FILE:-/etc/sing-box/all-sub.txt}"
+SERVED_SUB_FILE="${SERVED_SUB_FILE:-/etc/sing-box/sub.txt}"
+RESULT_DIR="${RESULT_DIR:-/etc/sing-box/cfy-results}"
 
 if [ "$0" != "$INSTALL_PATH" ]; then
     echo "正在安装 [cfy 节点优选生成器]..."
@@ -138,6 +138,61 @@ write_base64_file() {
     base64 "$source_file" | tr -d '\n\r' > "$sub_file"
 }
 
+add_url_candidate() {
+    local line="$1" existing
+
+    [ -n "$line" ] || return 0
+    for existing in "${urls[@]}"; do
+        [ "$existing" = "$line" ] && return 0
+    done
+    urls+=("$line")
+}
+
+load_urls_from_file() {
+    local source_file="$1" line
+
+    [ -s "$source_file" ] || return 1
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line//$'\r'/}"
+        [ -z "$line" ] && continue
+        add_url_candidate "$line"
+    done < "$source_file"
+}
+
+load_urls_from_base64_file() {
+    local source_file="$1" decoded line
+
+    [ -s "$source_file" ] || return 1
+    decoded=$(base64 -d "$source_file" 2>/dev/null || base64 --decode "$source_file" 2>/dev/null || true)
+    [ -n "$decoded" ] || return 1
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line//$'\r'/}"
+        [ -z "$line" ] && continue
+        add_url_candidate "$line"
+    done <<< "$decoded"
+}
+
+load_source_urls() {
+    urls=()
+    load_urls_from_file "$URL_FILE" || true
+    load_urls_from_file "$COMBINED_URL_FILE" || true
+    load_urls_from_file "$RESULT_FILE" || true
+    load_urls_from_base64_file "$SERVED_SUB_FILE" || true
+}
+
+show_template_sources_hint() {
+    local source_file
+
+    echo -e "${YELLOW}已检查以下模板来源:${NC}"
+    for source_file in "$URL_FILE" "$COMBINED_URL_FILE" "$RESULT_FILE" "$SERVED_SUB_FILE"; do
+        if [ -s "$source_file" ]; then
+            echo "  - $source_file (存在)"
+        else
+            echo "  - $source_file (不存在或为空)"
+        fi
+    done
+}
+
 sync_combined_subscription() {
     local tmp_file
     tmp_file=$(mktemp)
@@ -256,29 +311,33 @@ get_vless_query_param() {
 
 is_vless_ws_tls_argo() {
     local url="$1"
-    local security transport path
+    local security transport host sni
 
     [[ "$url" == vless://* ]] || return 1
     security="$(get_vless_query_param "$url" "security")"
     transport="$(get_vless_query_param "$url" "type")"
-    path="$(get_vless_query_param "$url" "path")"
+    host="$(get_vless_query_param "$url" "host")"
+    sni="$(get_vless_query_param "$url" "sni")"
 
-    [ "$security" = "tls" ] && [ "$transport" = "ws" ] && [ "$path" = "/vless-argo" ]
+    [ "$security" = "tls" ] || return 1
+    [ "$transport" = "ws" ] || return 1
+    [ -n "$host" ] || [ -n "$sni" ]
 }
 
 show_source_templates() {
     local found=0 line
 
-    [ -s "$URL_FILE" ] || return 1
+    load_source_urls
+    [ ${#urls[@]} -gt 0 ] || return 1
     echo -e "${GREEN}=== Sing-box 已创建的 VLESS-WS-TLS-Argo 模板节点 ===${NC}"
 
-    while IFS= read -r line; do
+    for line in "${urls[@]}"; do
         [ -z "$line" ] && continue
         if is_vless_ws_tls_argo "$line"; then
             echo "$line"
             found=1
         fi
-    done < "$URL_FILE"
+    done
 
     [ "$found" -eq 1 ]
 }
@@ -435,8 +494,8 @@ main() {
     echo -e "==================================================${NC}"
     echo ""
 
-    if [ -f "$url_file" ]; then
-        mapfile -t urls < "$url_file"
+    load_source_urls
+    if [ ${#urls[@]} -gt 0 ]; then
         select_vless_template
         if [ ${#valid_urls[@]} -eq 0 ]; then
             select_vmess_template
@@ -463,7 +522,8 @@ main() {
             done
         fi
     else
-        echo -e "${YELLOW}在 $url_file 中未找到有效节点.${NC}"
+        echo -e "${YELLOW}在 Sing-box 节点来源中未找到可用于优选的 VLESS-WS-TLS 或 VMess 模板.${NC}"
+        show_template_sources_hint
         while true; do
             read -p "请手动粘贴一个 vless:// 或 vmess:// 链接作为模板: " selected_url
             if [[ "$selected_url" == vless://* ]]; then

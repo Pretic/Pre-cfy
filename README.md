@@ -22,6 +22,7 @@
 
 ## 与 Sing-box 订阅的同步机制
 
+* cfy 会优先从 `/etc/sing-box/url.txt` 查找模板；如果基础文件里没有可用模板，还会继续检查 `/etc/sing-box/all-url.txt`、`/etc/sing-box/cfy-url.txt` 和已对外服务的 `/etc/sing-box/sub.txt`。
 * cfy 生成的优选节点会保存到 `/etc/sing-box/cfy-url.txt`，对应 Base64 文件为 `/etc/sing-box/cfy-sub.txt`。
 * 每次成功生成后，cfy 会把 `/etc/sing-box/url.txt` 的基础节点和 `/etc/sing-box/cfy-url.txt` 的优选节点合并到 `/etc/sing-box/all-url.txt`。
 * 合并后的 Base64 订阅写入 `/etc/sing-box/all-sub.txt`，并同步覆盖 `/etc/sing-box/sub.txt`，因此原来的 Nginx 订阅地址会自动包含优选节点。
