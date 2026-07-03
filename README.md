@@ -27,6 +27,7 @@
 * 每次成功生成后，cfy 会把 `/etc/sing-box/url.txt` 的基础节点和 `/etc/sing-box/cfy-url.txt` 的优选节点合并到 `/etc/sing-box/all-url.txt`。
 * 合并后的 Base64 订阅写入 `/etc/sing-box/all-sub.txt`，并同步覆盖 `/etc/sing-box/sub.txt`，因此原来的 Nginx 订阅地址会自动包含优选节点。
 * 如果还没有运行过 cfy，Sing-box 的订阅地址仍只包含基础节点，不会因为没有优选结果而失效。
+
 ## 命令速查
 
 ### cfy 新装
@@ -34,7 +35,7 @@
 bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/Pre-cfy/main/cfy.sh)
 ```
 
-### cfy 更新
+### 已安装后更新 cfy
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/Pre-cfy/main/cfy.sh) --update
 ```
@@ -48,6 +49,16 @@ cfy -c
 * 首次使用请执行新装命令；已经安装过且只想同步仓库脚本时，再执行更新命令。
 * 本仓库命令统一使用 `curl -fsSL`，下载失败时会显示错误，避免 `curl -Ls` 失败后 Bash 静默执行空脚本。
 * `cfy -c` 优先显示 `/etc/sing-box/cfy-url.txt` 中最近一次优选结果；如果还没生成过优选节点，会尝试显示 `/etc/sing-box/url.txt` 中可作为模板的 VLESS-WS-TLS-Argo 节点。
+
+## 已安装后如何更新
+
+以前已经安装过 `cfy` 时，直接执行上面的 `--update` 命令即可。它只覆盖 `/usr/local/bin/cfy`，不会自动开始优选生成，也不会修改 `/etc/sing-box/url.txt`、`/etc/sing-box/cfy-url.txt` 或当前对外订阅。
+
+更新完成后，如需重新生成优选节点，再手动运行：
+
+```bash
+cfy
+```
 
 ---
 
@@ -110,7 +121,7 @@ CFY_NAME_PREFIX=PreNet cfy
 
 ## 更新与卸载
 
-* **更新脚本**: 使用上方“命令速查”里的 `cfy 更新` 命令即可覆盖 `/usr/local/bin/cfy`，不会进入优选生成流程，也不会修改 sing-box 已有节点或最近一次优选结果。
+* **更新脚本**: 使用上方“已安装后更新 cfy”命令即可覆盖 `/usr/local/bin/cfy`，不会进入优选生成流程，也不会修改 sing-box 已有节点或最近一次优选结果。
 
 * **卸载脚本**: 只需删除安装好的文件即可。
     ```bash
