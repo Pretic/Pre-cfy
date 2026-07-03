@@ -184,14 +184,38 @@ write_base64_file() {
     base64 "$source_file" | tr -d '\n\r' > "$sub_file"
 }
 
-add_url_candidate() {
-    local line="$1" existing
+normalize_url_candidate() {
+    local line="$1"
+    local candidate=""
+    local esc=$'\033'
 
-    [ -n "$line" ] || return 0
+    line="${line//$'\r'/}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+
+    if [[ "$line" == vless://* || "$line" == vmess://* ]]; then
+        candidate="$line"
+    elif [[ "$line" =~ (vless://[^[:space:]]+|vmess://[^[:space:]]+) ]]; then
+        candidate="${BASH_REMATCH[1]}"
+    else
+        return 1
+    fi
+
+    candidate="${candidate%%${esc}*}"
+    candidate="${candidate%$'\r'}"
+    [ -n "$candidate" ] || return 1
+    printf '%s\n' "$candidate"
+}
+
+add_url_candidate() {
+    local line="$1" existing normalized
+
+    normalized=$(normalize_url_candidate "$line" || true)
+    [ -n "$normalized" ] || return 0
     for existing in "${urls[@]}"; do
-        [ "$existing" = "$line" ] && return 0
+        [ "$existing" = "$normalized" ] && return 0
     done
-    urls+=("$line")
+    urls+=("$normalized")
 }
 
 load_urls_from_file() {
