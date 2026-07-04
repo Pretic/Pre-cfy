@@ -9,6 +9,9 @@ COMBINED_URL_FILE="${COMBINED_URL_FILE:-/etc/sing-box/all-url.txt}"
 COMBINED_SUB_FILE="${COMBINED_SUB_FILE:-/etc/sing-box/all-sub.txt}"
 SERVED_SUB_FILE="${SERVED_SUB_FILE:-/etc/sing-box/sub.txt}"
 RESULT_DIR="${RESULT_DIR:-/etc/sing-box/cfy-results}"
+CFY_CURL_CONNECT_TIMEOUT="${CFY_CURL_CONNECT_TIMEOUT:-10}"
+CFY_CURL_MAX_TIME="${CFY_CURL_MAX_TIME:-30}"
+CFY_IP_VERSION_SCOPE="${CFY_IP_VERSION_SCOPE:-}"
 
 is_stdin_script() {
     case "$(basename "$0")" in
@@ -104,6 +107,35 @@ RED='\033[0;31m'
 NC='\033[0m'
 declare -a generated_urls
 
+atomic_write_file() {
+    local target_file="$1"
+    local mode="${2:-644}"
+    local target_dir target_name tmp_file
+
+    target_dir=$(dirname "$target_file")
+    target_name=$(basename "$target_file")
+    mkdir -p "$target_dir" || return 1
+    tmp_file=$(mktemp "${target_dir}/.tmp.${target_name}.XXXXXX") || return 1
+
+    if ! cat > "$tmp_file"; then
+        rm -f "$tmp_file"
+        return 1
+    fi
+    chmod "$mode" "$tmp_file" 2>/dev/null || true
+    mv -f "$tmp_file" "$target_file"
+}
+
+write_text_file() {
+    local target_file="$1"
+    shift
+
+    if [ "$#" -eq 0 ]; then
+        printf '' | atomic_write_file "$target_file" 644
+    else
+        printf '%s\n' "$@" | atomic_write_file "$target_file" 644
+    fi
+}
+
 show_help() {
     echo "用法: cfy [参数]"
     echo "  无参数        生成 Cloudflare 优选节点"
@@ -176,14 +208,25 @@ show_saved_results() {
 write_base64_file() {
     local source_file="${1:-$RESULT_FILE}"
     local sub_file="${2:-$SUB_FILE}"
+    local sub_dir sub_name tmp_file
 
-    [ -s "$source_file" ] || { : > "$sub_file"; return 0; }
-    if base64 -w0 "$source_file" > "$sub_file" 2>/dev/null; then
-        return 0
+    sub_dir=$(dirname "$sub_file")
+    sub_name=$(basename "$sub_file")
+    mkdir -p "$sub_dir" || return 1
+    tmp_file=$(mktemp "${sub_dir}/.tmp.${sub_name}.XXXXXX") || return 1
+
+    if [ ! -s "$source_file" ]; then
+        : > "$tmp_file"
+    elif ! base64 -w0 "$source_file" > "$tmp_file" 2>/dev/null; then
+        if ! base64 "$source_file" | tr -d '\n\r' > "$tmp_file"; then
+            rm -f "$tmp_file"
+            return 1
+        fi
     fi
-    base64 "$source_file" | tr -d '\n\r' > "$sub_file"
-}
 
+    chmod 644 "$tmp_file" 2>/dev/null || true
+    mv -f "$tmp_file" "$sub_file"
+}
 normalize_url_candidate() {
     local line="$1"
     local candidate=""
@@ -264,8 +307,10 @@ show_template_sources_hint() {
 }
 
 sync_combined_subscription() {
-    local tmp_file
-    tmp_file=$(mktemp)
+    local tmp_file combined_dir
+    combined_dir=$(dirname "$COMBINED_URL_FILE")
+    mkdir -p "$combined_dir" "$(dirname "$COMBINED_SUB_FILE")" "$(dirname "$SERVED_SUB_FILE")" || return 1
+    tmp_file=$(mktemp "${combined_dir}/.tmp.$(basename "$COMBINED_URL_FILE").XXXXXX") || return 1
 
     [ -s "$URL_FILE" ] && sed '/^[[:space:]]*$/d' "$URL_FILE" > "$tmp_file"
     if [ -s "$RESULT_FILE" ]; then
@@ -274,22 +319,21 @@ sync_combined_subscription() {
     fi
 
     if [ -s "$tmp_file" ]; then
-        mv "$tmp_file" "$COMBINED_URL_FILE"
-        write_base64_file "$COMBINED_URL_FILE" "$COMBINED_SUB_FILE"
-        cp "$COMBINED_SUB_FILE" "$SERVED_SUB_FILE"
-        chmod 644 "$COMBINED_URL_FILE" "$COMBINED_SUB_FILE" "$SERVED_SUB_FILE" 2>/dev/null || true
+        chmod 644 "$tmp_file" 2>/dev/null || true
+        mv -f "$tmp_file" "$COMBINED_URL_FILE" || { rm -f "$tmp_file"; return 1; }
+        write_base64_file "$COMBINED_URL_FILE" "$COMBINED_SUB_FILE" || return 1
+        write_base64_file "$COMBINED_URL_FILE" "$SERVED_SUB_FILE" || return 1
     else
         rm -f "$tmp_file"
     fi
 }
-
 save_generated_urls() {
     [ ${#generated_urls[@]} -eq 0 ] && return 0
 
     mkdir -p "$(dirname "$RESULT_FILE")" "$RESULT_DIR"
-    printf '%s\n' "${generated_urls[@]}" > "$RESULT_FILE"
-    write_base64_file
-    sync_combined_subscription
+    write_text_file "$RESULT_FILE" "${generated_urls[@]}" || return 1
+    write_base64_file || return 1
+    sync_combined_subscription || return 1
 
     local history_file="${RESULT_DIR}/$(date +%Y%m%d-%H%M%S).txt"
     cp "$RESULT_FILE" "$history_file" 2>/dev/null || true
@@ -297,6 +341,24 @@ save_generated_urls() {
     echo -e "${GREEN}已保存最近一次优选结果: ${RESULT_FILE}${NC}"
     echo -e "${GREEN}已同步到综合订阅: ${SERVED_SUB_FILE}${NC}"
     echo -e "${GREEN}后续可运行 cfy -c 再次查看。${NC}"
+}
+
+is_valid_edge_address() {
+    local edge="$1"
+    local host="$edge"
+
+    [ -n "$host" ] || return 1
+    host="${host%%/*}"
+    if [[ "$host" =~ ^\[([0-9A-Fa-f:.]+)\](:[0-9]+)?$ ]]; then
+        return 0
+    fi
+    if [[ "$host" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(:[0-9]+)?$ ]]; then
+        return 0
+    fi
+    if [[ "$host" =~ ^[0-9A-Fa-f:]+$ ]] && [[ "$host" == *:* ]]; then
+        return 0
+    fi
+    [[ "$host" =~ ^[A-Za-z0-9.-]+(:[0-9]+)?$ ]] && [[ "$host" == *.* ]]
 }
 
 check_deps() {
@@ -312,37 +374,66 @@ get_all_optimized_ips() {
     local url_v4="https://www.wetest.vip/page/cloudflare/address_v4.html"
     local url_v6="https://www.wetest.vip/page/cloudflare/address_v6.html"
 
-    echo -e "${YELLOW}正在合并获取所有优选 IP (IPv4 & IPv6)...${NC}"
+    echo -e "${YELLOW}Fetching optimized IP list (IPv4 & IPv6)...${NC}"
 
     local paired_data_file
-    paired_data_file=$(mktemp)
-    trap 'rm -f "$paired_data_file"' EXIT
+    paired_data_file=$(mktemp) || return 1
 
     parse_url() {
-        local url="$1"; local type_desc="$2"
-        echo -e "  -> 正在获取 ${type_desc} 列表..."
-        local html_content=$(curl -s "$url")
-        if [ -z "$html_content" ]; then echo -e "${RED}  -> 获取 ${type_desc} 列表失败!${NC}"; return; fi
-        local table_rows=$(echo "$html_content" | tr -d '\n\r' | sed 's/<tr>/\n&/g' | grep '^<tr>')
-        local ips=$(echo "$table_rows" | sed -n 's/.*data-label="优选地址">\([^<]*\)<.*/\1/p')
-        local isps=$(echo "$table_rows" | sed -n 's/.*data-label="线路名称">\([^<]*\)<.*/\1/p')
-        paste -d' ' <(echo "$ips") <(echo "$isps") >> "$paired_data_file"
+        local url="$1" type_desc="$2" html_content table_rows ips isps
+        local ip_label=$'\344\274\230\351\200\211\345\234\260\345\235\200'
+        local isp_label=$'\347\272\277\350\267\257\345\220\215\347\247\260'
+
+        echo -e "  -> Fetching ${type_desc} list..."
+        html_content=$(curl -fsSL --connect-timeout "$CFY_CURL_CONNECT_TIMEOUT" --max-time "$CFY_CURL_MAX_TIME" "$url" 2>/dev/null || true)
+        if [ -z "$html_content" ]; then
+            echo -e "${RED}  -> Failed to fetch ${type_desc} list.${NC}"
+            return
+        fi
+
+        table_rows=$(printf '%s' "$html_content" | tr -d '\n\r' | sed 's/<tr>/\n&/g' | grep '^<tr>' || true)
+        ips=$(printf '%s\n' "$table_rows" | sed -n "s/.*data-label=\"$ip_label\">\([^<]*\)<.*/\1/p")
+        isps=$(printf '%s\n' "$table_rows" | sed -n "s/.*data-label=\"$isp_label\">\([^<]*\)<.*/\1/p")
+        paste -d'|' <(printf '%s\n' "$ips") <(printf '%s\n' "$isps") | while IFS='|' read -r ip isp; do
+            ip=$(printf '%s' "$ip" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+            isp=$(printf '%s' "${isp:-CF}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/[[:space:]]\+/_/g')
+            is_valid_edge_address "$ip" || continue
+            printf '%s %s\n' "$ip" "${isp:-CF}" >> "$paired_data_file"
+        done
     }
 
-    parse_url "$url_v4" "IPv4"; parse_url "$url_v6" "IPv6"
+    parse_url "$url_v4" "IPv4"
+    parse_url "$url_v6" "IPv6"
 
-    if ! [ -s "$paired_data_file" ]; then echo -e "${RED}无法从任何来源解析出优选 IP 地址.${NC}"; return 1; fi
+    if ! [ -s "$paired_data_file" ]; then
+        rm -f "$paired_data_file"
+        echo -e "${RED}Failed to parse optimized IP addresses from all sources.${NC}"
+        return 1
+    fi
 
-    declare -g -a ip_list isp_list; local shuffled_pairs
+    declare -g -a ip_list isp_list
+    local shuffled_pairs pair count_ipv4=0 count_ipv6=0 edge_ip edge_isp edge_version
     mapfile -t shuffled_pairs < <(shuf "$paired_data_file")
+    rm -f "$paired_data_file"
     for pair in "${shuffled_pairs[@]}"; do
-        ip_list+=("$(echo "$pair" | cut -d' ' -f1)")
-        isp_list+=("$(echo "$pair" | cut -d' ' -f2-)")
+        edge_ip="$(echo "$pair" | cut -d' ' -f1)"
+        edge_isp="$(echo "$pair" | cut -d' ' -f2-)"
+        edge_version="$(get_edge_ip_version "$edge_ip")"
+        if [ "$edge_version" = "ipv6" ]; then
+            count_ipv6=$((count_ipv6 + 1))
+        else
+            count_ipv4=$((count_ipv4 + 1))
+        fi
+        ip_list+=("$edge_ip")
+        isp_list+=("$edge_isp")
     done
-    if [ ${#ip_list[@]} -eq 0 ]; then echo -e "${RED}解析成功, 但未找到任何有效的 IP 地址.${NC}"; return 1; fi
-    echo -e "${GREEN}成功合并获取 ${#ip_list[@]} 个优选 IP 地址, 列表已随机打乱.${NC}"; return 0
+    if [ ${#ip_list[@]} -eq 0 ]; then
+        echo -e "${RED}Parsed sources but found no valid IP addresses.${NC}"
+        return 1
+    fi
+    echo -e "${GREEN}Fetched ${#ip_list[@]} optimized IP addresses (${count_ipv4} IPv4, ${count_ipv6} IPv6) and shuffled the list.${NC}"
+    return 0
 }
-
 get_vless_ps() {
     local url="$1"
     local ps="${url##*#}"
@@ -355,6 +446,102 @@ get_vless_ps() {
 url_decode() {
     local value="${1//+/ }"
     printf '%b' "${value//%/\\x}"
+}
+
+url_encode_fragment() {
+    jq -nr --arg value "$1" '$value|@uri'
+}
+
+sanitize_remark() {
+    local value="$1"
+    value=$(printf '%s' "$value" | sed -E 's/[[:space:]]+/_/g; s/[^A-Za-z0-9._-]+/_/g; s/_+/_/g; s/^_//; s/_$//')
+    printf '%s\n' "$value"
+}
+
+get_name_prefix() {
+    local ps="$1"
+    local prefix="$ps"
+
+    prefix="${prefix%-vless-ws-tls-argo}"
+    prefix="${prefix%-vless-reality-ipv4}"
+    prefix="${prefix%-vless-reality-ipv6}"
+    prefix=$(printf '%s' "$prefix" | sed -E 's/[[:space:]]+/_/g; s/_+/_/g; s/^-+//; s/-+$//')
+    [ -n "$prefix" ] || prefix="PreNet"
+    printf '%s\n' "$prefix"
+}
+
+normalize_isp_group() {
+    local isp="$1"
+    local normalized
+
+    normalized=$(printf '%s' "$isp" | tr '[:upper:]' '[:lower:]')
+    case "$normalized" in
+        *电信*|*telecom*|*chinanet*|*ctcc*) printf '%s\n' "中国电信" ;;
+        *联通*|*unicom*|*china169*|*cucc*) printf '%s\n' "中国联通" ;;
+        *移动*|*mobile*|*cmcc*|*cmi*) printf '%s\n' "中国移动" ;;
+        *) return 1 ;;
+    esac
+}
+
+is_ipv6_edge() {
+    local edge="$1"
+    local host="${edge%%/*}"
+
+    if [[ "$host" =~ ^\[([0-9A-Fa-f:.]+)\](:[0-9]+)?$ ]]; then
+        return 0
+    fi
+    [[ "$host" =~ ^[0-9A-Fa-f:]+$ ]] && [[ "$host" == *:* ]]
+}
+
+get_edge_ip_version() {
+    if is_ipv6_edge "$1"; then
+        printf '%s\n' "ipv6"
+    else
+        printf '%s\n' "ipv4"
+    fi
+}
+
+choose_ip_version_scope() {
+    local choice
+
+    case "${CFY_IP_VERSION_SCOPE}" in
+        ipv4|IPv4|4)
+            IP_VERSION_SCOPE="ipv4"
+            return 0
+            ;;
+        both|BOTH|all|ALL|dual|DUAL|46|ipv4+ipv6|IPv4+IPv6)
+            IP_VERSION_SCOPE="both"
+            return 0
+            ;;
+        ipv6|IPv6|6)
+            IP_VERSION_SCOPE="ipv6"
+            return 0
+            ;;
+    esac
+
+    echo -e "${YELLOW}请选择云优选 IP 版本范围:${NC}"
+    echo "  1) IPv4"
+    echo "  2) IPv4 + IPv6"
+    echo "  3) IPv6"
+    while true; do
+        read -p "请输入选项编号 (1-3, 回车默认 1): " choice
+        case "$choice" in
+            ""|"1") IP_VERSION_SCOPE="ipv4"; break ;;
+            "2")    IP_VERSION_SCOPE="both"; break ;;
+            "3")    IP_VERSION_SCOPE="ipv6"; break ;;
+            *) echo -e "${RED}无效的输入, 请重试.${NC}" ;;
+        esac
+    done
+}
+
+should_include_ip_version() {
+    local ip_version="$1"
+
+    case "$IP_VERSION_SCOPE" in
+        both) return 0 ;;
+        ipv6) [ "$ip_version" = "ipv6" ] ;;
+        *)    [ "$ip_version" = "ipv4" ] ;;
+    esac
 }
 
 get_vless_query_param() {
@@ -460,9 +647,10 @@ update_vless_url() {
     local original_url="$1"
     local new_add="$2"
     local new_ps="$3"
-    local port endpoint prefix rest suffix updated
+    local port endpoint prefix rest suffix updated encoded_ps
 
     port=$(extract_vless_port "$original_url")
+    encoded_ps=$(url_encode_fragment "$new_ps")
     normalize_edge_input "$new_add" "$port"
     endpoint=$(format_host_port "$EDGE_HOST" "$EDGE_PORT")
     prefix="${original_url%%@*}@"
@@ -471,9 +659,9 @@ update_vless_url() {
     updated="${prefix}${endpoint}${suffix}"
 
     if [[ "$updated" == *"#"* ]]; then
-        updated="${updated%%#*}#${new_ps}"
+        updated="${updated%%#*}#${encoded_ps}"
     else
-        updated="${updated}#${new_ps}"
+        updated="${updated}#${encoded_ps}"
     fi
 
     echo "$updated"
@@ -627,7 +815,7 @@ main() {
     echo "  1) Cloudflare 官方 (手动优选)"
     echo "  2) 云优选  "
 
-    local ip_source_choice; local use_optimized_ips=false
+    local ip_source_choice; local use_optimized_ips=false; local IP_VERSION_SCOPE="ipv4"
     while true; do
         read -p "请输入选项编号 (1-2): " ip_source_choice
         if [[ "$ip_source_choice" == "1" ]]; then break;
@@ -638,10 +826,11 @@ main() {
     declare -a ip_list isp_list; local num_to_generate=0
     if $use_optimized_ips; then
         get_all_optimized_ips || exit 1
-        num_to_generate=${#ip_list[@]}
+        choose_ip_version_scope
+        num_to_generate=0
     else
         echo -e "${YELLOW}正在从 Cloudflare 官网获取 IPv4 地址列表...${NC}"
-        cloudflare_ips=$(curl -s https://www.cloudflare.com/ips-v4)
+        cloudflare_ips=$(curl -fsSL --connect-timeout "$CFY_CURL_CONNECT_TIMEOUT" --max-time "$CFY_CURL_MAX_TIME" https://www.cloudflare.com/ips-v4 2>/dev/null || true)
         if [ -z "$cloudflare_ips" ]; then echo -e "${RED}无法获取 Cloudflare IP 列表.${NC}"; exit 1; fi
         mapfile -t ip_list <<< "$cloudflare_ips"
         echo -e "${GREEN}成功获取 ${#ip_list[@]} 个 Cloudflare IPv4 地址段.${NC}"
@@ -654,11 +843,26 @@ main() {
 
     echo "---"; echo -e "${YELLOW}生成的新节点链接如下:${NC}"
     if $use_optimized_ips; then
-        for ((i=0; i<$num_to_generate; i++)); do
+        local name_prefix="${CFY_NAME_PREFIX:-$(get_name_prefix "$original_ps")}"
+        declare -A name_counts
+
+        for ((i=0; i<${#ip_list[@]}; i++)); do
             local current_ip=${ip_list[$i]}; local isp_name=${isp_list[$i]}
-            local name_prefix="${CFY_NAME_PREFIX:-$original_ps}"
-            local new_ps="${name_prefix}-优选${isp_name}"
-            local generated_url
+            local isp_group ip_version name_key new_ps generated_url
+
+            ip_version=$(get_edge_ip_version "$current_ip")
+            if ! should_include_ip_version "$ip_version"; then
+                continue
+            fi
+
+            isp_group=$(normalize_isp_group "$isp_name" || true)
+            name_key="${isp_group:-generic}-${ip_version}"
+            name_counts[$name_key]=$(( ${name_counts[$name_key]:-0} + 1 ))
+            if [ -n "$isp_group" ]; then
+                local new_ps="${name_prefix}-${isp_group}-${ip_version}-${name_counts[$name_key]}"
+            else
+                local new_ps="${name_prefix}-${ip_version}-${name_counts[$name_key]}"
+            fi
             if [ "$selected_type" = "vless" ]; then
                 generated_url=$(update_vless_url "$selected_url" "$current_ip" "$new_ps")
             else
@@ -666,7 +870,13 @@ main() {
             fi
             echo "$generated_url"
             generated_urls+=("$generated_url")
+            num_to_generate=$((num_to_generate + 1))
         done
+
+        if [ "$num_to_generate" -eq 0 ]; then
+            echo -e "${RED}未找到符合 IPv4/IPv6 条件的优选入口.${NC}"
+            exit 1
+        fi
     else
         for ((i=0; i<$num_to_generate; i++)); do
             local random_ip_range=${ip_list[$((RANDOM % ${#ip_list[@]}))]}
