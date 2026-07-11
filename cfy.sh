@@ -362,12 +362,33 @@ is_valid_edge_address() {
 }
 
 check_deps() {
-    for cmd in jq curl base64 grep sed mktemp shuf; do
+    for cmd in jq curl base64 grep sed mktemp; do
         if ! command -v "$cmd" &> /dev/null; then
             echo -e "${RED}错误: 命令 '$cmd' 未找到. 请先安装它.${NC}"
             exit 1
         fi
     done
+}
+
+collect_unique_optimized_pairs() {
+    local source_file="$1"
+    local pair edge_ip edge_isp
+    declare -A seen_edges=()
+
+    ip_list=()
+    isp_list=()
+
+    while IFS= read -r pair || [ -n "$pair" ]; do
+        [ -n "$pair" ] || continue
+        edge_ip="${pair%% *}"
+        edge_isp="${pair#* }"
+        if [[ -n "${seen_edges[$edge_ip]+x}" ]]; then
+            continue
+        fi
+        seen_edges["$edge_ip"]=1
+        ip_list+=("$edge_ip")
+        isp_list+=("$edge_isp")
+    done < "$source_file"
 }
 
 get_all_optimized_ips() {
@@ -412,26 +433,22 @@ get_all_optimized_ips() {
     fi
 
     declare -g -a ip_list isp_list
-    local shuffled_pairs pair count_ipv4=0 count_ipv6=0 edge_ip edge_isp edge_version
-    mapfile -t shuffled_pairs < <(shuf "$paired_data_file")
+    local count_ipv4=0 count_ipv6=0 edge_ip edge_version
+    collect_unique_optimized_pairs "$paired_data_file"
     rm -f "$paired_data_file"
-    for pair in "${shuffled_pairs[@]}"; do
-        edge_ip="$(echo "$pair" | cut -d' ' -f1)"
-        edge_isp="$(echo "$pair" | cut -d' ' -f2-)"
+    for edge_ip in "${ip_list[@]}"; do
         edge_version="$(get_edge_ip_version "$edge_ip")"
         if [ "$edge_version" = "ipv6" ]; then
             count_ipv6=$((count_ipv6 + 1))
         else
             count_ipv4=$((count_ipv4 + 1))
         fi
-        ip_list+=("$edge_ip")
-        isp_list+=("$edge_isp")
     done
     if [ ${#ip_list[@]} -eq 0 ]; then
         echo -e "${RED}Parsed sources but found no valid IP addresses.${NC}"
         return 1
     fi
-    echo -e "${GREEN}Fetched ${#ip_list[@]} optimized IP addresses (${count_ipv4} IPv4, ${count_ipv6} IPv6) and shuffled the list.${NC}"
+    echo -e "${GREEN}Fetched ${#ip_list[@]} unique optimized IP addresses (${count_ipv4} IPv4, ${count_ipv6} IPv6) in source order.${NC}"
     return 0
 }
 get_vless_ps() {

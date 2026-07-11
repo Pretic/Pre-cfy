@@ -35,3 +35,7 @@ jobs:
           fi
 
           echo "Verified ${checked} shell scripts"
+
+      - name: Verify candidate selection behavior
+        shell: bash
+        run: bash tests/test_candidate_selection.sh
