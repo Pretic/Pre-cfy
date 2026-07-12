@@ -39,3 +39,7 @@ jobs:
       - name: Verify candidate selection behavior
         shell: bash
         run: bash tests/test_candidate_selection.sh
+
+      - name: Verify combined subscription deduplication
+        shell: bash
+        run: bash tests/test_subscription_dedup.sh

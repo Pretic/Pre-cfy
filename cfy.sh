@@ -307,16 +307,25 @@ show_template_sources_hint() {
 }
 
 sync_combined_subscription() {
-    local tmp_file combined_dir
+    local tmp_file combined_dir source_file line
+    declare -A seen_urls=()
+
     combined_dir=$(dirname "$COMBINED_URL_FILE")
     mkdir -p "$combined_dir" "$(dirname "$COMBINED_SUB_FILE")" "$(dirname "$SERVED_SUB_FILE")" || return 1
     tmp_file=$(mktemp "${combined_dir}/.tmp.$(basename "$COMBINED_URL_FILE").XXXXXX") || return 1
 
-    [ -s "$URL_FILE" ] && sed '/^[[:space:]]*$/d' "$URL_FILE" > "$tmp_file"
-    if [ -s "$RESULT_FILE" ]; then
-        [ -s "$tmp_file" ] && printf '\n' >> "$tmp_file"
-        sed '/^[[:space:]]*$/d' "$RESULT_FILE" >> "$tmp_file"
-    fi
+    for source_file in "$URL_FILE" "$RESULT_FILE"; do
+        [ -s "$source_file" ] || continue
+        while IFS= read -r line || [ -n "$line" ]; do
+            line="${line%$'\r'}"
+            [ -n "${line//[[:space:]]/}" ] || continue
+            if [[ -n "${seen_urls[$line]+x}" ]]; then
+                continue
+            fi
+            seen_urls["$line"]=1
+            printf '%s\n' "$line" >> "$tmp_file"
+        done < "$source_file"
+    done
 
     if [ -s "$tmp_file" ]; then
         chmod 644 "$tmp_file" 2>/dev/null || true
