@@ -17,6 +17,7 @@
 * 兼容优选入口为域名、IPv4、IPv6、`host:port`、`[IPv6]:port` 等格式。
 * 保留旧 VMess 模板兼容逻辑，但仅作为找不到 VLESS 模板时的兜底。
 * 修正 IPv6 优选源，并从 Cloudflare 官方 CIDR 随机生成可用 IPv4 地址。
+* 读取第三方源的往返延迟，按“运营商 × IP 版本”排序；双栈每组最多保留 3 个，单栈每组最多保留 5 个，降低客户端批量测速超时和候选快速过期造成的假阴性。
 * 最近一次生成的优选节点会保存到 `/etc/sing-box/cfy-url.txt`，后续可用 `cfy -c` 再次查看。
 
 
@@ -32,7 +33,8 @@
 ## NAT 机使用说明
 
 * cfy 不在 VPS 上新增监听端口，只改写 `VLESS-WS-TLS-Argo` 模板里的 Cloudflare 入口地址和入口端口。
-* 云优选里的 `IPv4 + IPv6` 指客户端访问 Cloudflare 边缘入口的地址族，不要求 VPS 本身支持 IPv6；实际可用性取决于客户端网络和客户端软件。
+* 默认按 VPS 实际可用的出站栈选择候选；只有内网 IPv4、但能正常 IPv4 出网的 NAT 机仍会识别为 IPv4 单栈并输出每个运营商最多 5 个 IPv4 候选。
+* 云优选地址最终由客户端访问；如果 NAT VPS 没有 IPv6，但客户端有 IPv6 且仍希望生成 IPv6 入口，可用 `CFY_IP_VERSION_SCOPE=both cfy` 覆盖自动检测。实际可用性取决于客户端网络和客户端软件。
 * 端口受限 NAT 机建议优先使用 cfy 输出的 WS TLS Argo 节点；这类节点不需要服务商额外开放 `ARGO_PORT`。
 * 如果 Nginx 订阅端口没有映射，订阅 URL 可能不可访问，但仍可通过 `cfy -c` 或 `/etc/sing-box/cfy-url.txt` 查看最近一次生成的优选节点。
 
@@ -87,11 +89,12 @@ cfy
     1.  **Cloudflare 官方 IP**: 从 Cloudflare 官方获取全量 IPv4 地址段，用户可指定生成数量，脚本会随机选择 IP 进行替换。
     2.  **优选 IP (全自动)**:
         * 自动从第三方源抓取已优选的 **IPv4 和 IPv6 地址**。
-        * 按第三方源返回的原始顺序合并候选，不再随机打乱；相同 IP 仅保留第一次出现的记录。
-        * 符合所选 IPv4/IPv6 范围的去重候选会全部生成，不再按运营商限量。
+        * 解析第三方源的往返延迟，相同 IP 仅保留第一次出现的记录，再按“运营商 × IP 版本”从低 RTT 到高 RTT 排序。
+        * 自动检测 VPS 的实际 IPv4/IPv6 出站能力：双栈时每个运营商生成 3 个 IPv4 与 3 个 IPv6；单栈时每个运营商生成 5 个对应地址族的候选。IPv4 始终排在 IPv6 前面。
+        * `CFY_IP_VERSION_SCOPE` 可覆盖自动检测结果，`CFY_PER_ISP_LIMIT` 可覆盖自动计算的每组数量。
+        * 可选的 `CFY_HEALTH_PROBE=1` 会对模板的真实 SNI、Host 和 WebSocket path 做两次轻量 HTTPS 探测；它只适合在实际客户端网络运行 cfy 时启用。VPS 到 Cloudflare 的路由与客户端不同，因此 VPS 上默认关闭，避免误删客户端可用 IP。
         * 可识别的运营商会使用 `中国电信`、`中国联通`、`中国移动` 中文名称；通用或未知分组不额外加组名，但仍保留节点。
-        * 选择“云优选”并抓取地址后，可选择 `IPv4`、`IPv4 + IPv6` 或 `IPv6`；直接按回车默认选择 `IPv4`。VPS 本身没有 IPv6 也可以生成 Cloudflare IPv6 入口，是否可用取决于客户端网络。
-        * 抓取完成后会显示候选数量，例如 `15 IPv4, 15 IPv6`，方便确认双栈源是否正常。
+        * 抓取完成后会显示检测到的地址族范围及候选数量，方便确认双栈源是否正常。
         * 节点备注格式为 `前缀-中国联通-ipv4-序号` 这类中文运营商名称。
 
 ## 依赖要求
@@ -129,6 +132,13 @@ cfy -c
 ```bash
 CFY_NAME_PREFIX=PreNet cfy
 CFY_IP_VERSION_SCOPE=both cfy
+CFY_PER_ISP_LIMIT=2 cfy
+```
+
+如果是在与最终客户端相同的网络环境运行脚本，可显式启用候选健康探测：
+
+```bash
+CFY_HEALTH_PROBE=1 cfy
 ```
 
 ## 更新与卸载

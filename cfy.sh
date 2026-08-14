@@ -12,6 +12,12 @@ RESULT_DIR="${RESULT_DIR:-/etc/sing-box/cfy-results}"
 CFY_CURL_CONNECT_TIMEOUT="${CFY_CURL_CONNECT_TIMEOUT:-10}"
 CFY_CURL_MAX_TIME="${CFY_CURL_MAX_TIME:-30}"
 CFY_IP_VERSION_SCOPE="${CFY_IP_VERSION_SCOPE:-}"
+CFY_PER_ISP_LIMIT="${CFY_PER_ISP_LIMIT:-}"
+CFY_HEALTH_PROBE="${CFY_HEALTH_PROBE:-0}"
+CFY_HEALTH_PROBE_ATTEMPTS="${CFY_HEALTH_PROBE_ATTEMPTS:-2}"
+CFY_HEALTH_MIN_SUCCESS="${CFY_HEALTH_MIN_SUCCESS:-2}"
+CFY_HEALTH_CONNECT_TIMEOUT="${CFY_HEALTH_CONNECT_TIMEOUT:-3}"
+CFY_HEALTH_MAX_TIME="${CFY_HEALTH_MAX_TIME:-5}"
 
 is_stdin_script() {
     case "$(basename "$0")" in
@@ -400,6 +406,88 @@ collect_unique_optimized_pairs() {
     done < "$source_file"
 }
 
+collect_ranked_optimized_pairs() {
+    local source_file="$1"
+    local per_group_limit="${2:-3}"
+    local ip_scope="${3:-both}"
+    local line edge_ip edge_isp edge_latency edge_version group_key
+    local index group slot best_index best_latency desired_version
+    local -a candidate_ips candidate_isps candidate_latencies candidate_groups group_order
+    declare -A seen_edges=()
+    declare -A seen_groups=()
+    declare -A selected_indices=()
+
+    if [[ ! "$per_group_limit" =~ ^[1-9][0-9]*$ ]]; then
+        per_group_limit=3
+    fi
+
+    while IFS='|' read -r edge_ip edge_isp edge_latency || [ -n "$edge_ip" ]; do
+        edge_ip=$(printf '%s' "$edge_ip" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+        edge_isp=$(printf '%s' "${edge_isp:-CF}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/[[:space:]]\+/_/g')
+        is_valid_edge_address "$edge_ip" || continue
+        [[ "$edge_latency" =~ ^[0-9]+$ ]] || edge_latency=999999
+        if [[ -n "${seen_edges[$edge_ip]+x}" ]]; then
+            continue
+        fi
+        seen_edges["$edge_ip"]=1
+
+        edge_version=$(get_edge_ip_version "$edge_ip")
+        case "$ip_scope" in
+            ipv4) [ "$edge_version" = "ipv4" ] || continue ;;
+            ipv6) [ "$edge_version" = "ipv6" ] || continue ;;
+        esac
+        group_key="${edge_isp:-CF}|${edge_version}"
+        if [[ -z "${seen_groups[$group_key]+x}" ]]; then
+            seen_groups["$group_key"]=1
+            group_order+=("$group_key")
+        fi
+        candidate_ips+=("$edge_ip")
+        candidate_isps+=("${edge_isp:-CF}")
+        candidate_latencies+=("$edge_latency")
+        candidate_groups+=("$group_key")
+    done < "$source_file"
+
+    ip_list=()
+    isp_list=()
+    for desired_version in ipv4 ipv6; do
+        case "$ip_scope" in
+            ipv4) [ "$desired_version" = "ipv4" ] || continue ;;
+            ipv6) [ "$desired_version" = "ipv6" ] || continue ;;
+        esac
+        for group in "${group_order[@]}"; do
+            [ "${group##*|}" = "$desired_version" ] || continue
+            for ((slot=0; slot<per_group_limit; slot++)); do
+                best_index=-1
+                best_latency=1000000
+                for ((index=0; index<${#candidate_ips[@]}; index++)); do
+                    [ "${candidate_groups[$index]}" = "$group" ] || continue
+                    [[ -z "${selected_indices[$index]+x}" ]] || continue
+                    if [ "${candidate_latencies[$index]}" -lt "$best_latency" ]; then
+                        best_index=$index
+                        best_latency=${candidate_latencies[$index]}
+                    fi
+                done
+                [ "$best_index" -ge 0 ] || break
+                selected_indices["$best_index"]=1
+                ip_list+=("${candidate_ips[$best_index]}")
+                isp_list+=("${candidate_isps[$best_index]}")
+            done
+        done
+    done
+}
+
+get_candidate_group_limit() {
+    local ip_scope="$1"
+
+    if [[ "${CFY_PER_ISP_LIMIT:-}" =~ ^[1-9][0-9]*$ ]]; then
+        printf '%s\n' "$CFY_PER_ISP_LIMIT"
+    elif [ "$ip_scope" = "both" ]; then
+        printf '%s\n' "3"
+    else
+        printf '%s\n' "5"
+    fi
+}
+
 get_all_optimized_ips() {
     local url_v4="https://www.wetest.vip/page/cloudflare/address_v4.html"
     local url_v6="https://www.wetest.vip/page/cloudflare/address_v6.html"
@@ -410,9 +498,10 @@ get_all_optimized_ips() {
     paired_data_file=$(mktemp) || return 1
 
     parse_url() {
-        local url="$1" type_desc="$2" html_content table_rows ips isps
+        local url="$1" type_desc="$2" html_content table_rows row ip isp latency
         local ip_label=$'\344\274\230\351\200\211\345\234\260\345\235\200'
         local isp_label=$'\347\272\277\350\267\257\345\220\215\347\247\260'
+        local latency_label=$'\345\276\200\350\277\224\345\273\266\350\277\237'
 
         echo -e "  -> Fetching ${type_desc} list..."
         html_content=$(curl -fsSL --connect-timeout "$CFY_CURL_CONNECT_TIMEOUT" --max-time "$CFY_CURL_MAX_TIME" "$url" 2>/dev/null || true)
@@ -422,14 +511,15 @@ get_all_optimized_ips() {
         fi
 
         table_rows=$(printf '%s' "$html_content" | tr -d '\n\r' | sed 's/<tr>/\n&/g' | grep '^<tr>' || true)
-        ips=$(printf '%s\n' "$table_rows" | sed -n "s/.*data-label=\"$ip_label\">\([^<]*\)<.*/\1/p")
-        isps=$(printf '%s\n' "$table_rows" | sed -n "s/.*data-label=\"$isp_label\">\([^<]*\)<.*/\1/p")
-        paste -d'|' <(printf '%s\n' "$ips") <(printf '%s\n' "$isps") | while IFS='|' read -r ip isp; do
+        while IFS= read -r row || [ -n "$row" ]; do
+            ip=$(printf '%s' "$row" | sed -n "s/.*data-label=\"$ip_label\">\([^<]*\)<.*/\1/p")
+            isp=$(printf '%s' "$row" | sed -n "s/.*data-label=\"$isp_label\">\([^<]*\)<.*/\1/p")
+            latency=$(printf '%s' "$row" | sed -n "s/.*data-label=\"$latency_label\">\([^<]*\)<.*/\1/p" | tr -cd '0-9')
             ip=$(printf '%s' "$ip" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
             isp=$(printf '%s' "${isp:-CF}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/[[:space:]]\+/_/g')
             is_valid_edge_address "$ip" || continue
-            printf '%s %s\n' "$ip" "${isp:-CF}" >> "$paired_data_file"
-        done
+            printf '%s|%s|%s\n' "$ip" "${isp:-CF}" "${latency:-999999}" >> "$paired_data_file"
+        done <<< "$table_rows"
     }
 
     parse_url "$url_v4" "IPv4"
@@ -442,8 +532,9 @@ get_all_optimized_ips() {
     fi
 
     declare -g -a ip_list isp_list
-    local count_ipv4=0 count_ipv6=0 edge_ip edge_version
-    collect_unique_optimized_pairs "$paired_data_file"
+    local count_ipv4=0 count_ipv6=0 edge_ip edge_version group_limit
+    group_limit=$(get_candidate_group_limit "$IP_VERSION_SCOPE")
+    collect_ranked_optimized_pairs "$paired_data_file" "$group_limit" "$IP_VERSION_SCOPE"
     rm -f "$paired_data_file"
     for edge_ip in "${ip_list[@]}"; do
         edge_version="$(get_edge_ip_version "$edge_ip")"
@@ -457,7 +548,7 @@ get_all_optimized_ips() {
         echo -e "${RED}Parsed sources but found no valid IP addresses.${NC}"
         return 1
     fi
-    echo -e "${GREEN}Fetched ${#ip_list[@]} unique optimized IP addresses (${count_ipv4} IPv4, ${count_ipv6} IPv6) in source order.${NC}"
+    echo -e "${GREEN}Selected ${#ip_list[@]} low-RTT optimized IP addresses (${count_ipv4} IPv4, ${count_ipv6} IPv6; up to ${group_limit} per ISP/family; scope ${IP_VERSION_SCOPE}).${NC}"
     return 0
 }
 get_vless_ps() {
@@ -527,37 +618,50 @@ get_edge_ip_version() {
     fi
 }
 
+resolve_ip_version_scope() {
+    local requested_scope="${1:-}"
+    local has_ipv4="${2:-0}"
+    local has_ipv6="${3:-0}"
+
+    case "$requested_scope" in
+        ipv4|IPv4|4) printf '%s\n' "ipv4"; return 0 ;;
+        ipv6|IPv6|6) printf '%s\n' "ipv6"; return 0 ;;
+        both|BOTH|all|ALL|dual|DUAL|46|ipv4+ipv6|IPv4+IPv6) printf '%s\n' "both"; return 0 ;;
+    esac
+
+    if [ "$has_ipv4" = "1" ] && [ "$has_ipv6" = "1" ]; then
+        printf '%s\n' "both"
+    elif [ "$has_ipv6" = "1" ]; then
+        printf '%s\n' "ipv6"
+    else
+        printf '%s\n' "ipv4"
+    fi
+}
+
 choose_ip_version_scope() {
-    local choice
+    local has_ipv4=0 has_ipv6=0
 
     case "${CFY_IP_VERSION_SCOPE}" in
-        ipv4|IPv4|4)
-            IP_VERSION_SCOPE="ipv4"
-            return 0
-            ;;
-        both|BOTH|all|ALL|dual|DUAL|46|ipv4+ipv6|IPv4+IPv6)
-            IP_VERSION_SCOPE="both"
-            return 0
-            ;;
-        ipv6|IPv6|6)
-            IP_VERSION_SCOPE="ipv6"
+        ipv4|IPv4|4|ipv6|IPv6|6|both|BOTH|all|ALL|dual|DUAL|46|ipv4+ipv6|IPv4+IPv6)
+            IP_VERSION_SCOPE=$(resolve_ip_version_scope "$CFY_IP_VERSION_SCOPE" 0 0)
+            echo -e "${GREEN}Using requested IP stack scope: ${IP_VERSION_SCOPE}.${NC}"
             return 0
             ;;
     esac
 
-    echo -e "${YELLOW}请选择云优选 IP 版本范围:${NC}"
-    echo "  1) IPv4"
-    echo "  2) IPv4 + IPv6"
-    echo "  3) IPv6"
-    while true; do
-        read -p "请输入选项编号 (1-3, 回车默认 1): " choice
-        case "$choice" in
-            ""|"1") IP_VERSION_SCOPE="ipv4"; break ;;
-            "2")    IP_VERSION_SCOPE="both"; break ;;
-            "3")    IP_VERSION_SCOPE="ipv6"; break ;;
-            *) echo -e "${RED}无效的输入, 请重试.${NC}" ;;
-        esac
-    done
+    if curl -4 -fsS --connect-timeout 4 --max-time 8 -o /dev/null https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null; then
+        has_ipv4=1
+    fi
+    if curl -6 -fsS --connect-timeout 4 --max-time 8 -o /dev/null https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null; then
+        has_ipv6=1
+    fi
+
+    IP_VERSION_SCOPE=$(resolve_ip_version_scope "" "$has_ipv4" "$has_ipv6")
+    if [ "$has_ipv4" = "0" ] && [ "$has_ipv6" = "0" ]; then
+        echo -e "${YELLOW}Could not verify either IP stack; falling back to IPv4 candidates.${NC}"
+    else
+        echo -e "${GREEN}Detected VPS IP stack: ${IP_VERSION_SCOPE}.${NC}"
+    fi
 }
 
 should_include_ip_version() {
@@ -667,6 +771,50 @@ normalize_edge_input() {
     elif [[ "$edge" =~ ^\[([^]]+)\]$ ]]; then
         EDGE_HOST="${BASH_REMATCH[1]}"
     fi
+}
+
+probe_vless_edge_candidate() {
+    local original_url="$1"
+    local edge_address="$2"
+    local host sni path port tls_host request_host resolve_address result status
+    local attempts="${CFY_HEALTH_PROBE_ATTEMPTS:-2}"
+    local minimum_success="${CFY_HEALTH_MIN_SUCCESS:-2}"
+    local success_count=0 attempt
+
+    [[ "$attempts" =~ ^[1-9][0-9]*$ ]] || attempts=2
+    [[ "$minimum_success" =~ ^[1-9][0-9]*$ ]] || minimum_success=$attempts
+    [ "$minimum_success" -le "$attempts" ] || minimum_success=$attempts
+
+    host=$(get_vless_query_param "$original_url" "host" || true)
+    sni=$(get_vless_query_param "$original_url" "sni" || true)
+    path=$(get_vless_query_param "$original_url" "path" || true)
+    port=$(extract_vless_port "$original_url")
+    tls_host="${sni:-$host}"
+    request_host="${host:-$tls_host}"
+    [ -n "$tls_host" ] && [ -n "$request_host" ] || return 1
+    [ -n "$path" ] || path="/"
+
+    normalize_edge_input "$edge_address" "$port"
+    resolve_address="$EDGE_HOST"
+    if is_ipv6_edge "$EDGE_HOST"; then
+        resolve_address="[$EDGE_HOST]"
+    fi
+
+    for ((attempt=1; attempt<=attempts; attempt++)); do
+        result=$(curl --http1.1 --silent --output /dev/null \
+            --connect-timeout "${CFY_HEALTH_CONNECT_TIMEOUT:-3}" \
+            --max-time "${CFY_HEALTH_MAX_TIME:-5}" \
+            --resolve "${tls_host}:${EDGE_PORT}:${resolve_address}" \
+            --header "Host: ${request_host}" \
+            --write-out '%{http_code}|%{time_starttransfer}' \
+            "https://${tls_host}:${EDGE_PORT}${path}" 2>/dev/null || true)
+        status="${result%%|*}"
+        if [ "$status" = "400" ]; then
+            success_count=$((success_count + 1))
+        fi
+    done
+
+    [ "$success_count" -ge "$minimum_success" ]
 }
 
 update_vless_url() {
@@ -851,8 +999,8 @@ main() {
 
     declare -a ip_list isp_list; local num_to_generate=0
     if $use_optimized_ips; then
-        get_all_optimized_ips || exit 1
         choose_ip_version_scope
+        get_all_optimized_ips || exit 1
         num_to_generate=0
     else
         echo -e "${YELLOW}正在从 Cloudflare 官网获取 IPv4 地址列表...${NC}"
@@ -890,6 +1038,10 @@ main() {
                 local new_ps="${name_prefix}-${ip_version}-${name_counts[$name_key]}"
             fi
             if [ "$selected_type" = "vless" ]; then
+                if [ "$CFY_HEALTH_PROBE" != "0" ] && ! probe_vless_edge_candidate "$selected_url" "$current_ip"; then
+                    echo -e "${YELLOW}Skipping unhealthy edge candidate: ${current_ip}${NC}" >&2
+                    continue
+                fi
                 generated_url=$(update_vless_url "$selected_url" "$current_ip" "$new_ps")
             else
                 generated_url=$(update_vmess_url "$original_json" "$current_ip" "$new_ps")

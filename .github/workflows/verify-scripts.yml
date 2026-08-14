@@ -36,10 +36,11 @@ jobs:
 
           echo "Verified ${checked} shell scripts"
 
-      - name: Verify candidate selection behavior
+      - name: Run behavior tests
         shell: bash
-        run: bash tests/test_candidate_selection.sh
-
-      - name: Verify combined subscription deduplication
-        shell: bash
-        run: bash tests/test_subscription_dedup.sh
+        run: |
+          set -euo pipefail
+          for test_script in tests/*.sh; do
+            echo "Running ${test_script}"
+            bash "${test_script}"
+          done

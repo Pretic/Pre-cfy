@@ -43,26 +43,28 @@ if [[ "${isp_list[*]}" != "${expected_isps}" ]]; then
     exit 1
 fi
 
+source <(extract_function resolve_ip_version_scope)
 selector_source="$(extract_function choose_ip_version_scope)"
 source <(printf '%s\n' "${selector_source}")
 
+GREEN=''
 YELLOW=''
 RED=''
 NC=''
 
-CFY_IP_VERSION_SCOPE=''
+CFY_IP_VERSION_SCOPE='ipv4'
 IP_VERSION_SCOPE=''
-choose_ip_version_scope <<< '' >/dev/null
-[[ "${IP_VERSION_SCOPE}" == 'ipv4' ]] || { echo 'FAIL: Enter must default to IPv4' >&2; exit 1; }
+choose_ip_version_scope >/dev/null
+[[ "${IP_VERSION_SCOPE}" == 'ipv4' ]] || { echo 'FAIL: IPv4 override was not preserved' >&2; exit 1; }
 
-CFY_IP_VERSION_SCOPE=''
+CFY_IP_VERSION_SCOPE='both'
 IP_VERSION_SCOPE=''
-choose_ip_version_scope <<< '2' >/dev/null
-[[ "${IP_VERSION_SCOPE}" == 'both' ]] || { echo 'FAIL: option 2 must select dual stack' >&2; exit 1; }
+choose_ip_version_scope >/dev/null
+[[ "${IP_VERSION_SCOPE}" == 'both' ]] || { echo 'FAIL: dual-stack override was not preserved' >&2; exit 1; }
 
-CFY_IP_VERSION_SCOPE=''
+CFY_IP_VERSION_SCOPE='ipv6'
 IP_VERSION_SCOPE=''
-choose_ip_version_scope <<< '3' >/dev/null
-[[ "${IP_VERSION_SCOPE}" == 'ipv6' ]] || { echo 'FAIL: option 3 must select IPv6' >&2; exit 1; }
+choose_ip_version_scope >/dev/null
+[[ "${IP_VERSION_SCOPE}" == 'ipv6' ]] || { echo 'FAIL: IPv6 override was not preserved' >&2; exit 1; }
 
 echo 'Candidate selection tests passed.'
