@@ -2,6 +2,7 @@
 
 INSTALL_PATH="/usr/local/bin/cfy"
 REMOTE_URL="https://raw.githubusercontent.com/Pretic/Pre-cfy/main/cfy.sh"
+umask 077
 URL_FILE="${URL_FILE:-/etc/sing-box/url.txt}"
 RESULT_FILE="${RESULT_FILE:-/etc/sing-box/cfy-url.txt}"
 SUB_FILE="${SUB_FILE:-/etc/sing-box/cfy-sub.txt}"
@@ -136,9 +137,9 @@ write_text_file() {
     shift
 
     if [ "$#" -eq 0 ]; then
-        printf '' | atomic_write_file "$target_file" 644
+        printf '' | atomic_write_file "$target_file" 600
     else
-        printf '%s\n' "$@" | atomic_write_file "$target_file" 644
+        printf '%s\n' "$@" | atomic_write_file "$target_file" 600
     fi
 }
 
@@ -230,7 +231,7 @@ write_base64_file() {
         fi
     fi
 
-    chmod 644 "$tmp_file" 2>/dev/null || true
+    chmod 600 "$tmp_file" 2>/dev/null || true
     mv -f "$tmp_file" "$sub_file"
 }
 normalize_url_candidate() {
@@ -334,7 +335,7 @@ sync_combined_subscription() {
     done
 
     if [ -s "$tmp_file" ]; then
-        chmod 644 "$tmp_file" 2>/dev/null || true
+        chmod 600 "$tmp_file" 2>/dev/null || true
         mv -f "$tmp_file" "$COMBINED_URL_FILE" || { rm -f "$tmp_file"; return 1; }
         write_base64_file "$COMBINED_URL_FILE" "$COMBINED_SUB_FILE" || return 1
         write_base64_file "$COMBINED_URL_FILE" "$SERVED_SUB_FILE" || return 1
