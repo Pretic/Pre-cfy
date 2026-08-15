@@ -309,4 +309,3 @@ Expected: syntax and diff checks exit 0 and every test passes.
 git add cfy.sh README.md .github/workflows tests
 git commit -m "fix: clean cfy state and bound result history"
 ```
-
