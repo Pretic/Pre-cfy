@@ -20,10 +20,12 @@ trap 'rm -rf "${test_dir}"' EXIT
 plain_file="${test_dir}/url.txt"
 source_file="${test_dir}/source.txt"
 base64_file="${test_dir}/sub.txt"
+served_file="${test_dir}/served-sub.txt"
 
 write_text_file "${plain_file}" 'vless://secret@example.test'
 printf '%s\n' 'subscription-secret' > "${source_file}"
 write_base64_file "${source_file}" "${base64_file}"
+write_base64_file "${source_file}" "${served_file}" 644
 
 text_writer_source="$(extract_function write_text_file)"
 grep -q 'atomic_write_file.*600' <<< "${text_writer_source}" || {
@@ -31,8 +33,12 @@ grep -q 'atomic_write_file.*600' <<< "${text_writer_source}" || {
     exit 1
 }
 base64_writer_source="$(extract_function write_base64_file)"
-grep -q 'chmod 600.*tmp_file' <<< "${base64_writer_source}" || {
-    echo 'FAIL: encoded subscription writer must request mode 600' >&2
+grep -q 'output_mode=.*3:-600' <<< "${base64_writer_source}" || {
+    echo 'FAIL: encoded subscription writer must default to mode 600' >&2
+    exit 1
+}
+grep -q 'chmod.*output_mode.*tmp_file' <<< "${base64_writer_source}" || {
+    echo 'FAIL: encoded subscription writer must apply the requested mode' >&2
     exit 1
 }
 
@@ -47,6 +53,10 @@ case "$(uname -s)" in
             echo 'FAIL: encoded subscription output must use mode 600' >&2
             exit 1
         }
+        [[ "$(stat -c '%a' "${served_file}")" == '644' ]] || {
+            echo 'FAIL: Nginx-served subscription output must use mode 644' >&2
+            exit 1
+        }
         ;;
 esac
 grep -q '^umask 077$' "${cfy_script}" || {
@@ -57,6 +67,10 @@ grep -q '^umask 077$' "${cfy_script}" || {
 combined_source="$(extract_function sync_combined_subscription)"
 grep -q 'chmod 600.*COMBINED_URL_FILE\|chmod 600.*tmp_file' <<< "${combined_source}" || {
     echo 'FAIL: combined plaintext subscription output must use mode 600' >&2
+    exit 1
+}
+grep -q 'write_base64_file.*SERVED_SUB_FILE.*644' <<< "${combined_source}" || {
+    echo 'FAIL: Nginx-served subscription must explicitly request mode 644' >&2
     exit 1
 }
 

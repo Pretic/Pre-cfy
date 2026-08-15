@@ -215,7 +215,13 @@ show_saved_results() {
 write_base64_file() {
     local source_file="${1:-$RESULT_FILE}"
     local sub_file="${2:-$SUB_FILE}"
+    local output_mode="${3:-600}"
     local sub_dir sub_name tmp_file
+
+    case "$output_mode" in
+        600|644) ;;
+        *) return 1 ;;
+    esac
 
     sub_dir=$(dirname "$sub_file")
     sub_name=$(basename "$sub_file")
@@ -231,7 +237,7 @@ write_base64_file() {
         fi
     fi
 
-    chmod 600 "$tmp_file" 2>/dev/null || true
+    chmod "$output_mode" "$tmp_file" 2>/dev/null || true
     mv -f "$tmp_file" "$sub_file"
 }
 normalize_url_candidate() {
@@ -338,7 +344,7 @@ sync_combined_subscription() {
         chmod 600 "$tmp_file" 2>/dev/null || true
         mv -f "$tmp_file" "$COMBINED_URL_FILE" || { rm -f "$tmp_file"; return 1; }
         write_base64_file "$COMBINED_URL_FILE" "$COMBINED_SUB_FILE" || return 1
-        write_base64_file "$COMBINED_URL_FILE" "$SERVED_SUB_FILE" || return 1
+        write_base64_file "$COMBINED_URL_FILE" "$SERVED_SUB_FILE" 644 || return 1
     else
         rm -f "$tmp_file"
     fi

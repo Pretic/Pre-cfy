@@ -28,6 +28,7 @@
 * 每次成功生成后，cfy 会把 `/etc/sing-box/url.txt` 的基础节点和 `/etc/sing-box/cfy-url.txt` 的优选节点合并到 `/etc/sing-box/all-url.txt`。
 * 合并基础节点与 cfy 优选节点时，会按首次出现顺序移除完全相同的链接；不同备注或不同连接字段的节点不会被合并。
 * 合并后的 Base64 订阅写入 `/etc/sing-box/all-sub.txt`，并同步覆盖 `/etc/sing-box/sub.txt`，因此原来的 Nginx 订阅地址会自动包含优选节点。
+* 内部订阅文件默认保持 `0600`；只有 Nginx 实际发布的 `/etc/sing-box/sub.txt` 使用 `0644`，避免 Nginx 非 root 工作进程在 cfy 更新后因无读取权限返回 403。
 * 如果还没有运行过 cfy，Sing-box 的订阅地址仍只包含基础节点，不会因为没有优选结果而失效。
 
 ## NAT 机使用说明
