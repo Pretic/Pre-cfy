@@ -13,6 +13,7 @@ extract_function() {
 source <(extract_function atomic_write_file)
 source <(extract_function write_text_file)
 source <(extract_function write_base64_file)
+source <(extract_function repair_served_subscription_file)
 
 test_dir="$(mktemp -d)"
 trap 'rm -rf "${test_dir}"' EXIT
@@ -21,11 +22,16 @@ plain_file="${test_dir}/url.txt"
 source_file="${test_dir}/source.txt"
 base64_file="${test_dir}/sub.txt"
 served_file="${test_dir}/served-sub.txt"
+migration_file="${test_dir}/existing-served-sub.txt"
 
 write_text_file "${plain_file}" 'vless://secret@example.test'
 printf '%s\n' 'subscription-secret' > "${source_file}"
 write_base64_file "${source_file}" "${base64_file}"
 write_base64_file "${source_file}" "${served_file}" 644
+printf '%s\n' 'existing-subscription' > "${migration_file}"
+chmod 600 "${migration_file}" 2>/dev/null || true
+SERVED_SUB_FILE="${migration_file}"
+repair_served_subscription_file
 
 text_writer_source="$(extract_function write_text_file)"
 grep -q 'atomic_write_file.*600' <<< "${text_writer_source}" || {
@@ -57,6 +63,10 @@ case "$(uname -s)" in
             echo 'FAIL: Nginx-served subscription output must use mode 644' >&2
             exit 1
         }
+        [[ "$(stat -c '%a' "${migration_file}")" == '644' ]] || {
+            echo 'FAIL: an existing served subscription must be repaired to mode 644' >&2
+            exit 1
+        }
         ;;
 esac
 grep -q '^umask 077$' "${cfy_script}" || {
@@ -71,6 +81,18 @@ grep -q 'chmod 600.*COMBINED_URL_FILE\|chmod 600.*tmp_file' <<< "${combined_sour
 }
 grep -q 'write_base64_file.*SERVED_SUB_FILE.*644' <<< "${combined_source}" || {
     echo 'FAIL: Nginx-served subscription must explicitly request mode 644' >&2
+    exit 1
+}
+
+finish_install_source="$(extract_function finish_install)"
+grep -q 'repair_served_subscription_file' <<< "${finish_install_source}" || {
+    echo 'FAIL: remote install/update must repair an existing served subscription' >&2
+    exit 1
+}
+
+update_source="$(extract_function update_self)"
+grep -q 'repair_served_subscription_file' <<< "${update_source}" || {
+    echo 'FAIL: installed cfy --update must repair an existing served subscription' >&2
     exit 1
 }
 

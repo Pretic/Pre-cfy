@@ -20,6 +20,11 @@ CFY_HEALTH_MIN_SUCCESS="${CFY_HEALTH_MIN_SUCCESS:-2}"
 CFY_HEALTH_CONNECT_TIMEOUT="${CFY_HEALTH_CONNECT_TIMEOUT:-3}"
 CFY_HEALTH_MAX_TIME="${CFY_HEALTH_MAX_TIME:-5}"
 
+repair_served_subscription_file() {
+    [ -e "$SERVED_SUB_FILE" ] || return 0
+    chmod 644 "$SERVED_SUB_FILE"
+}
+
 is_stdin_script() {
     case "$(basename "$0")" in
         bash|sh|-bash)
@@ -70,6 +75,10 @@ finish_install() {
     if ! chmod +x "$INSTALL_PATH"; then
         echo "❌ 安装后赋权失败，请检查权限。"
         exit 1
+    fi
+
+    if ! repair_served_subscription_file; then
+        echo "警告: 无法修复 $SERVED_SUB_FILE 的读取权限，请手动执行 chmod 644。"
     fi
 
     echo "✅ 安装成功! 您现在可以随时随地运行 'cfy' 命令。"
@@ -191,6 +200,9 @@ update_self() {
     fi
 
     rm -f "$tmp_file"
+    if ! repair_served_subscription_file; then
+        echo -e "${YELLOW}警告: 无法修复 $SERVED_SUB_FILE 的读取权限，请手动执行 chmod 644。${NC}"
+    fi
     show_update_done
 }
 
