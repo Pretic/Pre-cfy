@@ -9,6 +9,7 @@ SUB_FILE="${SUB_FILE:-/etc/sing-box/cfy-sub.txt}"
 COMBINED_URL_FILE="${COMBINED_URL_FILE:-/etc/sing-box/all-url.txt}"
 COMBINED_SUB_FILE="${COMBINED_SUB_FILE:-/etc/sing-box/all-sub.txt}"
 SERVED_SUB_FILE="${SERVED_SUB_FILE:-/etc/sing-box/sub.txt}"
+SUBSCRIPTION_LOCK_FILE="${SUBSCRIPTION_LOCK_FILE:-/etc/sing-box/.subscription.lock}"
 RESULT_DIR="${RESULT_DIR:-/etc/sing-box/cfy-results}"
 CFY_CURL_CONNECT_TIMEOUT="${CFY_CURL_CONNECT_TIMEOUT:-10}"
 CFY_CURL_MAX_TIME="${CFY_CURL_MAX_TIME:-30}"
@@ -23,6 +24,14 @@ CFY_HEALTH_MAX_TIME="${CFY_HEALTH_MAX_TIME:-5}"
 repair_served_subscription_file() {
     [ -e "$SERVED_SUB_FILE" ] || return 0
     chmod 644 "$SERVED_SUB_FILE"
+}
+
+require_flock_dependency() {
+    if command -v flock >/dev/null 2>&1; then
+        return 0
+    fi
+    echo "错误: 未找到 flock。Debian/Ubuntu 与 Alpine 均请安装 util-linux；订阅文件未作任何修改。" >&2
+    return 1
 }
 
 is_stdin_script() {
@@ -101,6 +110,8 @@ if [ "$0" != "$INSTALL_PATH" ]; then
         echo "错误: 安装需要管理员权限。请使用 'curl ... | sudo bash' 或 'sudo bash <(curl ...)' 命令来运行。"
         exit 1
     fi
+
+    require_flock_dependency || exit 1
 
     echo "正在将脚本写入到 $INSTALL_PATH..."
 
@@ -224,6 +235,81 @@ show_saved_results() {
     [ -d "$RESULT_DIR" ] && echo -e "${GREEN}历史结果目录: ${RESULT_DIR}${NC}"
 }
 
+with_subscription_lock() {
+    local lock_file="${SUBSCRIPTION_LOCK_FILE:-/etc/sing-box/.subscription.lock}"
+    local timeout_seconds="${SUBSCRIPTION_LOCK_TIMEOUT_SECONDS:-30}"
+    local lock_dir lock_status=0
+    local subscription_lock_fd
+
+    if [ "${SUBSCRIPTION_LOCK_HELD:-0}" = 1 ]; then
+        "$@"
+        return $?
+    fi
+    [[ "$timeout_seconds" =~ ^[0-9]+$ ]] || return 1
+    command -v flock >/dev/null 2>&1 || return 1
+    lock_dir=$(dirname "$lock_file") || return 1
+    mkdir -p "$lock_dir" || return 1
+    if [ -e "$lock_file" ] || [ -L "$lock_file" ]; then
+        [ -f "$lock_file" ] && [ ! -L "$lock_file" ] || return 1
+    fi
+    (umask 077 && : >> "$lock_file") || return 1
+    chmod 600 "$lock_file" || return 1
+    exec {subscription_lock_fd}>>"$lock_file" || return 1
+    if ! flock -x -w "$timeout_seconds" "$subscription_lock_fd"; then
+        exec {subscription_lock_fd}>&-
+        return 1
+    fi
+
+    local SUBSCRIPTION_LOCK_HELD=1
+    "$@" || lock_status=$?
+    flock -u "$subscription_lock_fd" 2>/dev/null || true
+    exec {subscription_lock_fd}>&-
+    return "$lock_status"
+}
+
+get_subscription_source_generation() {
+    local source_file="${1:-$URL_FILE}"
+    local digest byte_count
+
+    [ -f "$source_file" ] && [ ! -L "$source_file" ] || return 1
+    digest=$(sha256sum "$source_file" 2>/dev/null) || return 1
+    digest=${digest%%[[:space:]]*}
+    [[ "$digest" =~ ^[0-9A-Fa-f]{64}$ ]] || return 1
+    byte_count=$(wc -c < "$source_file") || return 1
+    byte_count=${byte_count//[[:space:]]/}
+    [[ "$byte_count" =~ ^[0-9]+$ ]] || return 1
+    printf '%s:%s\n' "${digest,,}" "$byte_count"
+}
+
+verify_subscription_source_generation_locked() {
+    local expected_generation="${1:-}"
+    local current_generation
+
+    [ "${SUBSCRIPTION_LOCK_HELD:-0}" = 1 ] || return 1
+    [ -n "$expected_generation" ] || {
+        echo -e "${RED}订阅源代际未知；拒绝发布长任务结果。${NC}" >&2
+        return 1
+    }
+    current_generation=$(get_subscription_source_generation "$URL_FILE") || return 1
+    if [ "$current_generation" != "$expected_generation" ]; then
+        echo -e "${RED}Sing-box 订阅源已变化；丢弃基于旧代际生成的结果。${NC}" >&2
+        return 1
+    fi
+}
+
+encode_subscription_source() {
+    local source_file="$1"
+    local output_file="$2"
+
+    if [ ! -s "$source_file" ]; then
+        : > "$output_file"
+    elif base64 -w0 "$source_file" > "$output_file" 2>/dev/null; then
+        return 0
+    else
+        (set -o pipefail; base64 "$source_file" | tr -d '\n\r' > "$output_file")
+    fi
+}
+
 write_base64_file() {
     local source_file="${1:-$RESULT_FILE}"
     local sub_file="${2:-$SUB_FILE}"
@@ -240,17 +326,12 @@ write_base64_file() {
     mkdir -p "$sub_dir" || return 1
     tmp_file=$(mktemp "${sub_dir}/.tmp.${sub_name}.XXXXXX") || return 1
 
-    if [ ! -s "$source_file" ]; then
-        : > "$tmp_file"
-    elif ! base64 -w0 "$source_file" > "$tmp_file" 2>/dev/null; then
-        if ! base64 "$source_file" | tr -d '\n\r' > "$tmp_file"; then
-            rm -f "$tmp_file"
-            return 1
-        fi
+    if [ -e "$sub_file" ] || [ -L "$sub_file" ]; then
+        [ -f "$sub_file" ] && [ ! -L "$sub_file" ] || { rm -f "$tmp_file"; return 1; }
     fi
-
-    chmod "$output_mode" "$tmp_file" 2>/dev/null || true
-    mv -f "$tmp_file" "$sub_file"
+    encode_subscription_source "$source_file" "$tmp_file" || { rm -f "$tmp_file"; return 1; }
+    chmod "$output_mode" "$tmp_file" || { rm -f "$tmp_file"; return 1; }
+    mv -f "$tmp_file" "$sub_file" || { rm -f "$tmp_file"; return 1; }
 }
 normalize_url_candidate() {
     local line="$1"
@@ -310,12 +391,18 @@ load_urls_from_base64_file() {
     done <<< "$decoded"
 }
 
-load_source_urls() {
+load_source_urls_locked() {
+    local source_generation
+
+    [ "${SUBSCRIPTION_LOCK_HELD:-0}" = 1 ] || return 1
     urls=()
     load_urls_from_file "$URL_FILE" || true
-    load_urls_from_file "$COMBINED_URL_FILE" || true
-    load_urls_from_file "$RESULT_FILE" || true
-    load_urls_from_base64_file "$SERVED_SUB_FILE" || true
+    source_generation=$(get_subscription_source_generation "$URL_FILE") || return 1
+    SOURCE_URL_GENERATION="$source_generation"
+}
+
+load_source_urls() {
+    with_subscription_lock load_source_urls_locked
 }
 
 show_template_sources_hint() {
@@ -331,50 +418,157 @@ show_template_sources_hint() {
     done
 }
 
-sync_combined_subscription() {
-    local tmp_file combined_dir source_file line
-    declare -A seen_urls=()
+publish_subscriptions_locked() {
+    local staged_result_file="${1:-}"
+    local expected_source_generation="${2:-}"
+    local cfy_source_file=/dev/null
+    local tmp_base_sub tmp_cfy_sub tmp_all_url tmp_all_sub tmp_sub target_file
+    local base_sub_file="${BASE_SUB_FILE:-$(dirname "$URL_FILE")/base-sub.txt}"
+    local backup_file commit_failed=0 rollback_failed=0 index restore_index
+    local -a commit_sources=() commit_targets=() backup_files=() target_existed=()
 
-    combined_dir=$(dirname "$COMBINED_URL_FILE")
-    mkdir -p "$combined_dir" "$(dirname "$COMBINED_SUB_FILE")" "$(dirname "$SERVED_SUB_FILE")" || return 1
-    tmp_file=$(mktemp "${combined_dir}/.tmp.$(basename "$COMBINED_URL_FILE").XXXXXX") || return 1
+    [ "${SUBSCRIPTION_LOCK_HELD:-0}" = 1 ] || return 1
+    if [ -n "$expected_source_generation" ]; then
+        verify_subscription_source_generation_locked "$expected_source_generation" || return 1
+    fi
+    for target_file in "$URL_FILE" "$RESULT_FILE" "$base_sub_file" "$SUB_FILE" \
+        "$COMBINED_URL_FILE" "$COMBINED_SUB_FILE" "$SERVED_SUB_FILE"; do
+        mkdir -p "$(dirname "$target_file")" || return 1
+        if [ -e "$target_file" ] || [ -L "$target_file" ]; then
+            [ -f "$target_file" ] && [ ! -L "$target_file" ] || return 1
+        fi
+    done
+    [ -f "$URL_FILE" ] || return 1
+    chmod 600 "$URL_FILE" || return 1
 
-    for source_file in "$URL_FILE" "$RESULT_FILE"; do
-        [ -s "$source_file" ] || continue
-        while IFS= read -r line || [ -n "$line" ]; do
-            line="${line%$'\r'}"
-            [ -n "${line//[[:space:]]/}" ] || continue
-            if [[ -n "${seen_urls[$line]+x}" ]]; then
-                continue
-            fi
-            seen_urls["$line"]=1
-            printf '%s\n' "$line" >> "$tmp_file"
-        done < "$source_file"
+    if [ -n "$staged_result_file" ]; then
+        [ -f "$staged_result_file" ] && [ ! -L "$staged_result_file" ] || return 1
+        chmod 600 "$staged_result_file" || return 1
+        cfy_source_file="$staged_result_file"
+    elif [ -e "$RESULT_FILE" ]; then
+        chmod 600 "$RESULT_FILE" || return 1
+        cfy_source_file="$RESULT_FILE"
+    fi
+
+    tmp_base_sub=$(mktemp "$(dirname "$base_sub_file")/.tmp.$(basename "$base_sub_file").XXXXXX") || return 1
+    tmp_cfy_sub=$(mktemp "$(dirname "$SUB_FILE")/.tmp.$(basename "$SUB_FILE").XXXXXX") || { rm -f "$tmp_base_sub"; return 1; }
+    tmp_all_url=$(mktemp "$(dirname "$COMBINED_URL_FILE")/.tmp.$(basename "$COMBINED_URL_FILE").XXXXXX") || { rm -f "$tmp_base_sub" "$tmp_cfy_sub"; return 1; }
+    tmp_all_sub=$(mktemp "$(dirname "$COMBINED_SUB_FILE")/.tmp.$(basename "$COMBINED_SUB_FILE").XXXXXX") || { rm -f "$tmp_base_sub" "$tmp_cfy_sub" "$tmp_all_url"; return 1; }
+    tmp_sub=$(mktemp "$(dirname "$SERVED_SUB_FILE")/.tmp.$(basename "$SERVED_SUB_FILE").XXXXXX") || { rm -f "$tmp_base_sub" "$tmp_cfy_sub" "$tmp_all_url" "$tmp_all_sub"; return 1; }
+
+    if ! awk '{ sub(/\r$/, ""); if ($0 ~ /^[[:space:]]*$/) next; if (!seen[$0]++) print }' \
+        "$URL_FILE" "$cfy_source_file" 2>/dev/null > "$tmp_all_url" ||
+       ! encode_subscription_source "$URL_FILE" "$tmp_base_sub" ||
+       ! encode_subscription_source "$cfy_source_file" "$tmp_cfy_sub" ||
+       ! encode_subscription_source "$tmp_all_url" "$tmp_all_sub" ||
+       ! encode_subscription_source "$tmp_all_url" "$tmp_sub" ||
+       ! chmod 600 "$tmp_base_sub" "$tmp_cfy_sub" "$tmp_all_url" "$tmp_all_sub" ||
+       ! chmod 644 "$tmp_sub"; then
+        rm -f "$tmp_base_sub" "$tmp_cfy_sub" "$tmp_all_url" "$tmp_all_sub" "$tmp_sub"
+        return 1
+    fi
+
+    if [ -n "$expected_source_generation" ] &&
+       ! verify_subscription_source_generation_locked "$expected_source_generation"; then
+        rm -f "$tmp_base_sub" "$tmp_cfy_sub" "$tmp_all_url" "$tmp_all_sub" "$tmp_sub"
+        return 1
+    fi
+
+    if [ -n "$staged_result_file" ]; then
+        commit_sources+=("$staged_result_file")
+        commit_targets+=("$RESULT_FILE")
+    fi
+    commit_sources+=("$tmp_base_sub" "$tmp_cfy_sub" "$tmp_all_url" "$tmp_all_sub" "$tmp_sub")
+    commit_targets+=("$base_sub_file" "$SUB_FILE" "$COMBINED_URL_FILE" "$COMBINED_SUB_FILE" "$SERVED_SUB_FILE")
+
+    for ((index = 0; index < ${#commit_targets[@]}; index++)); do
+        target_file="${commit_targets[$index]}"
+        backup_file=$(mktemp "$(dirname "$target_file")/.tmp.$(basename "$target_file").rollback.XXXXXX") || {
+            rm -f "${commit_sources[@]}" "${backup_files[@]}"
+            return 1
+        }
+        if [ -f "$target_file" ]; then
+            cp -p -- "$target_file" "$backup_file" || {
+                rm -f "$backup_file" "${commit_sources[@]}" "${backup_files[@]}"
+                return 1
+            }
+            target_existed+=(1)
+        else
+            rm -f "$backup_file"
+            target_existed+=(0)
+        fi
+        backup_files+=("$backup_file")
     done
 
-    if [ -s "$tmp_file" ]; then
-        chmod 600 "$tmp_file" 2>/dev/null || true
-        mv -f "$tmp_file" "$COMBINED_URL_FILE" || { rm -f "$tmp_file"; return 1; }
-        write_base64_file "$COMBINED_URL_FILE" "$COMBINED_SUB_FILE" || return 1
-        write_base64_file "$COMBINED_URL_FILE" "$SERVED_SUB_FILE" 644 || return 1
-    else
-        rm -f "$tmp_file"
+    for ((index = 0; index < ${#commit_targets[@]}; index++)); do
+        if ! mv -f -- "${commit_sources[$index]}" "${commit_targets[$index]}"; then
+            commit_failed=1
+            for ((restore_index = index - 1; restore_index >= 0; restore_index--)); do
+                if [ "${target_existed[$restore_index]}" = 1 ]; then
+                    if ! mv -f -- "${backup_files[$restore_index]}" "${commit_targets[$restore_index]}"; then
+                        rollback_failed=1
+                        printf 'FATAL: subscription rollback failed; preserved backup %s for %s\n' \
+                            "${backup_files[$restore_index]}" "${commit_targets[$restore_index]}" >&2
+                    fi
+                else
+                    if ! rm -f -- "${commit_targets[$restore_index]}"; then
+                        rollback_failed=1
+                        printf 'FATAL: subscription rollback failed; remove manually: %s\n' \
+                            "${commit_targets[$restore_index]}" >&2
+                    fi
+                fi
+            done
+            break
+        fi
+    done
+    rm -f "${commit_sources[@]}"
+    if [ "$commit_failed" -eq 0 ]; then
+        rm -f "${backup_files[@]}"
+        return 0
     fi
+    if [ "$rollback_failed" -ne 0 ]; then
+        printf 'FATAL: subscription rollback was incomplete; recovery files remain beside the subscription targets\n' >&2
+        return 2
+    fi
+    rm -f "${backup_files[@]}"
+    return 1
 }
-save_generated_urls() {
+
+sync_combined_subscription() {
+    with_subscription_lock publish_subscriptions_locked
+}
+
+save_generated_urls_locked() {
+    local result_dir staged_result_file history_file publish_status
+    local expected_source_generation="${SOURCE_URL_GENERATION:-}"
+
     [ ${#generated_urls[@]} -eq 0 ] && return 0
+    verify_subscription_source_generation_locked "$expected_source_generation" || return 1
 
-    mkdir -p "$(dirname "$RESULT_FILE")" "$RESULT_DIR"
-    write_text_file "$RESULT_FILE" "${generated_urls[@]}" || return 1
-    write_base64_file || return 1
-    sync_combined_subscription || return 1
+    result_dir=$(dirname "$RESULT_FILE") || return 1
+    mkdir -p "$result_dir" "$RESULT_DIR" || return 1
+    if [ -e "$RESULT_FILE" ] || [ -L "$RESULT_FILE" ]; then
+        [ -f "$RESULT_FILE" ] && [ ! -L "$RESULT_FILE" ] || return 1
+    fi
+    staged_result_file=$(mktemp "${result_dir}/.tmp.$(basename "$RESULT_FILE").XXXXXX") || return 1
+    printf '%s\n' "${generated_urls[@]}" > "$staged_result_file" || { rm -f "$staged_result_file"; return 1; }
+    chmod 600 "$staged_result_file" || { rm -f "$staged_result_file"; return 1; }
+    publish_subscriptions_locked "$staged_result_file" "$expected_source_generation" || {
+        publish_status=$?
+        rm -f "$staged_result_file"
+        return "$publish_status"
+    }
 
-    local history_file="${RESULT_DIR}/$(date +%Y%m%d-%H%M%S).txt"
+    history_file="${RESULT_DIR}/$(date +%Y%m%d-%H%M%S).txt"
     cp "$RESULT_FILE" "$history_file" 2>/dev/null || true
 
     echo -e "${GREEN}已保存最近一次优选结果: ${RESULT_FILE}${NC}"
     echo -e "${GREEN}已同步到综合订阅: ${SERVED_SUB_FILE}${NC}"
     echo -e "${GREEN}后续可运行 cfy -c 再次查看。${NC}"
+}
+
+save_generated_urls() {
+    with_subscription_lock save_generated_urls_locked
 }
 
 is_valid_edge_address() {
@@ -396,9 +590,13 @@ is_valid_edge_address() {
 }
 
 check_deps() {
-    for cmd in jq curl base64 grep sed mktemp; do
+    for cmd in jq curl base64 grep sed mktemp flock sha256sum; do
         if ! command -v "$cmd" &> /dev/null; then
-            echo -e "${RED}错误: 命令 '$cmd' 未找到. 请先安装它.${NC}"
+            if [ "$cmd" = flock ]; then
+                echo -e "${RED}错误: 命令 'flock' 未找到。Debian/Ubuntu 与 Alpine 均请安装 util-linux.${NC}"
+            else
+                echo -e "${RED}错误: 命令 '$cmd' 未找到. 请先安装它.${NC}"
+            fi
             exit 1
         fi
     done
@@ -733,7 +931,7 @@ is_vless_ws_tls_argo() {
 show_source_templates() {
     local found=0 line
 
-    load_source_urls
+    load_source_urls || return 1
     [ ${#urls[@]} -gt 0 ] || return 1
     echo -e "${GREEN}=== Sing-box 已创建的 VLESS-WS-TLS-Argo 模板节点 ===${NC}"
 
@@ -930,6 +1128,20 @@ select_vmess_template() {
     done
 }
 
+finalize_generated_urls() {
+    local generated_count="${1:-0}"
+    local publish_status
+
+    save_generated_urls
+    publish_status=$?
+    if [ "$publish_status" -ne 0 ]; then
+        echo -e "${RED}订阅发布失败；未更新成功结果。${NC}" >&2
+        return "$publish_status"
+    fi
+    echo "---"
+    echo -e "${GREEN}共 ${generated_count} 个链接已生成完毕.${NC}"
+}
+
 main() {
     local url_file="$URL_FILE"
     declare -a valid_urls valid_ps_names valid_types
@@ -945,7 +1157,10 @@ main() {
     echo -e "==================================================${NC}"
     echo ""
 
-    load_source_urls
+    load_source_urls || {
+        echo -e "${RED}读取 Sing-box 模板失败；订阅锁不可用或超时。${NC}" >&2
+        return 1
+    }
     if [ ${#urls[@]} -gt 0 ]; then
         select_vless_template
         if [ ${#valid_urls[@]} -eq 0 ]; then
@@ -1091,8 +1306,7 @@ main() {
             generated_urls+=("$generated_url")
         done
     fi
-    save_generated_urls
-    echo "---"; echo -e "${GREEN}共 ${num_to_generate} 个链接已生成完毕.${NC}"
+    finalize_generated_urls "$num_to_generate" || return $?
 }
 
 case "$1" in

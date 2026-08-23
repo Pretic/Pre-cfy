@@ -12,6 +12,7 @@ extract_function() {
 
 source <(extract_function atomic_write_file)
 source <(extract_function write_text_file)
+source <(extract_function encode_subscription_source)
 source <(extract_function write_base64_file)
 source <(extract_function repair_served_subscription_file)
 
@@ -74,12 +75,12 @@ grep -q '^umask 077$' "${cfy_script}" || {
     exit 1
 }
 
-combined_source="$(extract_function sync_combined_subscription)"
-grep -q 'chmod 600.*COMBINED_URL_FILE\|chmod 600.*tmp_file' <<< "${combined_source}" || {
+combined_source="$(extract_function publish_subscriptions_locked)"
+grep -q 'chmod 600.*tmp_base_sub.*tmp_cfy_sub.*tmp_all_url.*tmp_all_sub' <<< "${combined_source}" || {
     echo 'FAIL: combined plaintext subscription output must use mode 600' >&2
     exit 1
 }
-grep -q 'write_base64_file.*SERVED_SUB_FILE.*644' <<< "${combined_source}" || {
+grep -q 'chmod 644.*tmp_sub' <<< "${combined_source}" || {
     echo 'FAIL: Nginx-served subscription must explicitly request mode 644' >&2
     exit 1
 }

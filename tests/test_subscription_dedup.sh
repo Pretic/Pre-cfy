@@ -10,6 +10,9 @@ extract_function() {
     sed -n "/^${function_name}() {/,/^}/p" "${cfy_script}"
 }
 
+source <(extract_function with_subscription_lock)
+source <(extract_function encode_subscription_source)
+source <(extract_function publish_subscriptions_locked)
 source <(extract_function sync_combined_subscription)
 
 fixture_dir="$(mktemp -d)"
@@ -17,11 +20,13 @@ trap 'rm -rf "${fixture_dir}"' EXIT
 
 URL_FILE="${fixture_dir}/url.txt"
 RESULT_FILE="${fixture_dir}/cfy-url.txt"
+SUB_FILE="${fixture_dir}/cfy-sub.txt"
 COMBINED_URL_FILE="${fixture_dir}/all-url.txt"
 COMBINED_SUB_FILE="${fixture_dir}/all-sub.txt"
 SERVED_SUB_FILE="${fixture_dir}/sub.txt"
+SUBSCRIPTION_LOCK_FILE="${fixture_dir}/.subscription.lock"
 
-write_base64_file() { return 0; }
+flock() { return 0; }
 
 printf '%s\n' \
     'vless://base-a' \
