@@ -11,6 +11,10 @@ extract_function() {
 }
 
 source <(extract_function with_subscription_lock)
+source <(extract_function get_subscription_source_generation)
+source <(extract_function read_strict_subscription_generation_file)
+source <(extract_function read_cfy_source_generation_file)
+source <(extract_function select_existing_cfy_subscription_source_locked)
 source <(extract_function encode_subscription_source)
 source <(extract_function publish_subscriptions_locked)
 source <(extract_function sync_combined_subscription)
@@ -25,6 +29,7 @@ COMBINED_URL_FILE="${fixture_dir}/all-url.txt"
 COMBINED_SUB_FILE="${fixture_dir}/all-sub.txt"
 SERVED_SUB_FILE="${fixture_dir}/sub.txt"
 SUBSCRIPTION_LOCK_FILE="${fixture_dir}/.subscription.lock"
+CFY_SOURCE_GENERATION_FILE="${fixture_dir}/cfy-source.generation"
 
 flock() { return 0; }
 
@@ -39,6 +44,8 @@ printf '%s\r\n' \
     'vless://result-b' \
     'vless://same-fields#remark-two' \
     'vless://result-b' > "${RESULT_FILE}"
+printf '%s\n' "$(get_subscription_source_generation "$URL_FILE")" > "$CFY_SOURCE_GENERATION_FILE"
+chmod 600 "$CFY_SOURCE_GENERATION_FILE"
 
 sync_combined_subscription
 

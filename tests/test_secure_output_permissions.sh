@@ -84,6 +84,19 @@ grep -q 'chmod 644.*tmp_sub' <<< "${combined_source}" || {
     echo 'FAIL: Nginx-served subscription must explicitly request mode 644' >&2
     exit 1
 }
+grep -q 'chmod 600.*tmp_sidecar' <<< "${combined_source}" || {
+    echo 'FAIL: cfy source generation sidecar must be staged with mode 600' >&2
+    exit 1
+}
+grep -Fq 'CFY_SOURCE_GENERATION_FILE="${CFY_SOURCE_GENERATION_FILE:-/etc/sing-box/cfy-source.generation}"' "${cfy_script}" || {
+    echo 'FAIL: cfy source generation sidecar path is not canonical' >&2
+    exit 1
+}
+sidecar_reader_source="$(extract_function read_cfy_source_generation_file)"
+if grep -q 'chmod' <<< "${sidecar_reader_source}"; then
+    echo 'FAIL: reading an untrusted sidecar must not repair or rewrite it' >&2
+    exit 1
+fi
 
 finish_install_source="$(extract_function finish_install)"
 grep -q 'repair_served_subscription_file' <<< "${finish_install_source}" || {

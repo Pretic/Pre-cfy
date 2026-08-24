@@ -10,6 +10,7 @@ COMBINED_URL_FILE="${COMBINED_URL_FILE:-/etc/sing-box/all-url.txt}"
 COMBINED_SUB_FILE="${COMBINED_SUB_FILE:-/etc/sing-box/all-sub.txt}"
 SERVED_SUB_FILE="${SERVED_SUB_FILE:-/etc/sing-box/sub.txt}"
 SUBSCRIPTION_LOCK_FILE="${SUBSCRIPTION_LOCK_FILE:-/etc/sing-box/.subscription.lock}"
+CFY_SOURCE_GENERATION_FILE="${CFY_SOURCE_GENERATION_FILE:-/etc/sing-box/cfy-source.generation}"
 RESULT_DIR="${RESULT_DIR:-/etc/sing-box/cfy-results}"
 CFY_CURL_CONNECT_TIMEOUT="${CFY_CURL_CONNECT_TIMEOUT:-10}"
 CFY_CURL_MAX_TIME="${CFY_CURL_MAX_TIME:-30}"
@@ -281,6 +282,48 @@ get_subscription_source_generation() {
     printf '%s:%s\n' "${digest,,}" "$byte_count"
 }
 
+read_strict_subscription_generation_file() {
+    local generation_file="${1:-}"
+    local generation file_mode
+
+    [ -n "$generation_file" ] || return 1
+    [ -f "$generation_file" ] && [ ! -L "$generation_file" ] || return 1
+    file_mode=$(stat -c '%a' -- "$generation_file" 2>/dev/null) || return 1
+    [ "$file_mode" = 600 ] || return 1
+    generation=$(awk '
+        NR == 1 { value = $0; next }
+        { invalid = 1 }
+        END {
+            if (NR != 1 || invalid) exit 1
+            printf "%s", value
+        }
+    ' "$generation_file") || return 1
+    [[ "$generation" =~ ^[0-9a-f]{64}:[0-9]+$ ]] || return 1
+    printf '%s\n' "$generation"
+}
+
+read_cfy_source_generation_file() {
+    local generation_file="${1:-$CFY_SOURCE_GENERATION_FILE}"
+
+    read_strict_subscription_generation_file "$generation_file"
+}
+
+select_existing_cfy_subscription_source_locked() {
+    local current_generation="${1:-}"
+    local cfy_generation
+
+    [ "${SUBSCRIPTION_LOCK_HELD:-0}" = 1 ] || return 1
+    [[ "$current_generation" =~ ^[0-9a-f]{64}:[0-9]+$ ]] || return 1
+    if [ -f "$RESULT_FILE" ] && [ ! -L "$RESULT_FILE" ] &&
+       cfy_generation=$(read_cfy_source_generation_file "$CFY_SOURCE_GENERATION_FILE") &&
+       [ "$cfy_generation" = "$current_generation" ]; then
+        chmod 600 "$RESULT_FILE" || return 1
+        printf '%s\n' "$RESULT_FILE"
+    else
+        printf '/dev/null\n'
+    fi
+}
+
 verify_subscription_source_generation_locked() {
     local expected_generation="${1:-}"
     local current_generation
@@ -422,32 +465,38 @@ publish_subscriptions_locked() {
     local staged_result_file="${1:-}"
     local expected_source_generation="${2:-}"
     local cfy_source_file=/dev/null
-    local tmp_base_sub tmp_cfy_sub tmp_all_url tmp_all_sub tmp_sub target_file
+    local tmp_base_sub tmp_cfy_sub tmp_all_url tmp_all_sub tmp_sub tmp_sidecar='' target_file
     local base_sub_file="${BASE_SUB_FILE:-$(dirname "$URL_FILE")/base-sub.txt}"
+    local current_source_generation
     local backup_file commit_failed=0 rollback_failed=0 index restore_index
     local -a commit_sources=() commit_targets=() backup_files=() target_existed=()
 
     [ "${SUBSCRIPTION_LOCK_HELD:-0}" = 1 ] || return 1
-    if [ -n "$expected_source_generation" ]; then
-        verify_subscription_source_generation_locked "$expected_source_generation" || return 1
-    fi
-    for target_file in "$URL_FILE" "$RESULT_FILE" "$base_sub_file" "$SUB_FILE" \
+    for target_file in "$URL_FILE" "$base_sub_file" "$SUB_FILE" \
         "$COMBINED_URL_FILE" "$COMBINED_SUB_FILE" "$SERVED_SUB_FILE"; do
         mkdir -p "$(dirname "$target_file")" || return 1
         if [ -e "$target_file" ] || [ -L "$target_file" ]; then
             [ -f "$target_file" ] && [ ! -L "$target_file" ] || return 1
         fi
     done
+    mkdir -p "$(dirname "$RESULT_FILE")" "$(dirname "$CFY_SOURCE_GENERATION_FILE")" || return 1
     [ -f "$URL_FILE" ] || return 1
     chmod 600 "$URL_FILE" || return 1
+    current_source_generation=$(get_subscription_source_generation "$URL_FILE") || return 1
 
     if [ -n "$staged_result_file" ]; then
+        [[ "$expected_source_generation" =~ ^[0-9a-f]{64}:[0-9]+$ ]] || return 1
+        verify_subscription_source_generation_locked "$expected_source_generation" || return 1
         [ -f "$staged_result_file" ] && [ ! -L "$staged_result_file" ] || return 1
         chmod 600 "$staged_result_file" || return 1
+        for target_file in "$RESULT_FILE" "$CFY_SOURCE_GENERATION_FILE"; do
+            if [ -e "$target_file" ] || [ -L "$target_file" ]; then
+                [ -f "$target_file" ] && [ ! -L "$target_file" ] || return 1
+            fi
+        done
         cfy_source_file="$staged_result_file"
-    elif [ -e "$RESULT_FILE" ]; then
-        chmod 600 "$RESULT_FILE" || return 1
-        cfy_source_file="$RESULT_FILE"
+    else
+        cfy_source_file=$(select_existing_cfy_subscription_source_locked "$current_source_generation") || return 1
     fi
 
     tmp_base_sub=$(mktemp "$(dirname "$base_sub_file")/.tmp.$(basename "$base_sub_file").XXXXXX") || return 1
@@ -455,6 +504,20 @@ publish_subscriptions_locked() {
     tmp_all_url=$(mktemp "$(dirname "$COMBINED_URL_FILE")/.tmp.$(basename "$COMBINED_URL_FILE").XXXXXX") || { rm -f "$tmp_base_sub" "$tmp_cfy_sub"; return 1; }
     tmp_all_sub=$(mktemp "$(dirname "$COMBINED_SUB_FILE")/.tmp.$(basename "$COMBINED_SUB_FILE").XXXXXX") || { rm -f "$tmp_base_sub" "$tmp_cfy_sub" "$tmp_all_url"; return 1; }
     tmp_sub=$(mktemp "$(dirname "$SERVED_SUB_FILE")/.tmp.$(basename "$SERVED_SUB_FILE").XXXXXX") || { rm -f "$tmp_base_sub" "$tmp_cfy_sub" "$tmp_all_url" "$tmp_all_sub"; return 1; }
+    if [ -n "$staged_result_file" ]; then
+        tmp_sidecar=$(mktemp "$(dirname "$CFY_SOURCE_GENERATION_FILE")/.tmp.$(basename "$CFY_SOURCE_GENERATION_FILE").XXXXXX") || {
+            rm -f "$tmp_base_sub" "$tmp_cfy_sub" "$tmp_all_url" "$tmp_all_sub" "$tmp_sub"
+            return 1
+        }
+        printf '%s\n' "$expected_source_generation" > "$tmp_sidecar" || {
+            rm -f "$tmp_base_sub" "$tmp_cfy_sub" "$tmp_all_url" "$tmp_all_sub" "$tmp_sub" "$tmp_sidecar"
+            return 1
+        }
+        chmod 600 "$tmp_sidecar" || {
+            rm -f "$tmp_base_sub" "$tmp_cfy_sub" "$tmp_all_url" "$tmp_all_sub" "$tmp_sub" "$tmp_sidecar"
+            return 1
+        }
+    fi
 
     if ! awk '{ sub(/\r$/, ""); if ($0 ~ /^[[:space:]]*$/) next; if (!seen[$0]++) print }' \
         "$URL_FILE" "$cfy_source_file" 2>/dev/null > "$tmp_all_url" ||
@@ -465,18 +528,22 @@ publish_subscriptions_locked() {
        ! chmod 600 "$tmp_base_sub" "$tmp_cfy_sub" "$tmp_all_url" "$tmp_all_sub" ||
        ! chmod 644 "$tmp_sub"; then
         rm -f "$tmp_base_sub" "$tmp_cfy_sub" "$tmp_all_url" "$tmp_all_sub" "$tmp_sub"
+        [ -n "$tmp_sidecar" ] && rm -f "$tmp_sidecar"
         return 1
     fi
 
     if [ -n "$expected_source_generation" ] &&
        ! verify_subscription_source_generation_locked "$expected_source_generation"; then
         rm -f "$tmp_base_sub" "$tmp_cfy_sub" "$tmp_all_url" "$tmp_all_sub" "$tmp_sub"
+        [ -n "$tmp_sidecar" ] && rm -f "$tmp_sidecar"
         return 1
     fi
 
     if [ -n "$staged_result_file" ]; then
         commit_sources+=("$staged_result_file")
         commit_targets+=("$RESULT_FILE")
+        commit_sources+=("$tmp_sidecar")
+        commit_targets+=("$CFY_SOURCE_GENERATION_FILE")
     fi
     commit_sources+=("$tmp_base_sub" "$tmp_cfy_sub" "$tmp_all_url" "$tmp_all_sub" "$tmp_sub")
     commit_targets+=("$base_sub_file" "$SUB_FILE" "$COMBINED_URL_FILE" "$COMBINED_SUB_FILE" "$SERVED_SUB_FILE")

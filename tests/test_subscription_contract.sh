@@ -30,6 +30,9 @@ for function_name in \
     write_text_file \
     with_subscription_lock \
     get_subscription_source_generation \
+    read_strict_subscription_generation_file \
+    read_cfy_source_generation_file \
+    select_existing_cfy_subscription_source_locked \
     verify_subscription_source_generation_locked \
     encode_subscription_source \
     publish_subscriptions_locked \
@@ -54,6 +57,8 @@ COMBINED_URL_FILE="${fixture_dir}/all-url.txt"
 COMBINED_SUB_FILE="${fixture_dir}/all-sub.txt"
 SERVED_SUB_FILE="${fixture_dir}/sub.txt"
 SUBSCRIPTION_LOCK_FILE="${fixture_dir}/.subscription.lock"
+CFY_SOURCE_GENERATION_FILE="${fixture_dir}/cfy-source.generation"
+BASE_SUB_FILE="${fixture_dir}/base-sub.txt"
 
 printf '%s\n' \
     'vless://base-a' \
@@ -64,6 +69,9 @@ printf '%s\r\n' \
     'vless://cfy-b' \
     'vless://same-fields#two' \
     'vless://cfy-b' > "$RESULT_FILE"
+initial_generation="$(get_subscription_source_generation "$URL_FILE")"
+printf '%s\n' "$initial_generation" > "$CFY_SOURCE_GENERATION_FILE"
+chmod 600 "$CFY_SOURCE_GENERATION_FILE"
 
 flock() { return 0; }
 sync_combined_subscription || fail 'cfy subscription publication failed'
@@ -80,7 +88,7 @@ cmp -s "$COMBINED_URL_FILE" <(base64 -d "$SERVED_SUB_FILE") || \
 case "$(uname -s)" in
     MINGW*|MSYS*|CYGWIN*) ;;
     *)
-        for internal in "$URL_FILE" "$RESULT_FILE" "$SUB_FILE" "$COMBINED_URL_FILE" "$COMBINED_SUB_FILE"; do
+        for internal in "$URL_FILE" "$RESULT_FILE" "$CFY_SOURCE_GENERATION_FILE" "$SUB_FILE" "$COMBINED_URL_FILE" "$COMBINED_SUB_FILE"; do
             [[ "$(stat -c '%a' "$internal")" == 600 ]] || fail "$(basename "$internal") is not mode 600"
         done
         [[ "$(stat -c '%a' "$SERVED_SUB_FILE")" == 644 ]] || fail 'sub.txt is not mode 644'
@@ -88,6 +96,78 @@ case "$(uname -s)" in
             fail 'subscription lock is not mode 600'
         ;;
 esac
+
+assert_cfy_sync_base_only() {
+    local expected_base="$1"
+    local old_result_checksum="$2"
+    local old_sidecar_checksum="${3:-}"
+
+    [[ "$(cat "$COMBINED_URL_FILE")" == "$expected_base" ]] || \
+        fail 'untrusted existing cfy data leaked into all-url.txt'
+    [[ "$(base64 -d "$SERVED_SUB_FILE")" == "$expected_base" ]] || \
+        fail 'untrusted existing cfy data leaked into the served subscription'
+    [[ "$(cksum < "$RESULT_FILE")" == "$old_result_checksum" ]] || \
+        fail 'base-only publication changed the retained cfy result'
+    if [[ -n "$old_sidecar_checksum" ]]; then
+        [[ "$(cksum < "$CFY_SOURCE_GENERATION_FILE")" == "$old_sidecar_checksum" ]] || \
+            fail 'base-only publication changed the retained cfy sidecar'
+    fi
+}
+
+base_only_expected=$'vless://base-a\nvless://shared\nvless://same-fields#one'
+retained_result_checksum="$(cksum < "$RESULT_FILE")"
+
+rm -f "$CFY_SOURCE_GENERATION_FILE"
+sync_combined_subscription || fail 'missing cfy sidecar did not degrade to base-only publication'
+assert_cfy_sync_base_only "$base_only_expected" "$retained_result_checksum"
+
+printf '%s\n' 'malformed-generation' > "$CFY_SOURCE_GENERATION_FILE"
+chmod 600 "$CFY_SOURCE_GENERATION_FILE"
+malformed_sidecar_checksum="$(cksum < "$CFY_SOURCE_GENERATION_FILE")"
+sync_combined_subscription || fail 'malformed cfy sidecar did not degrade to base-only publication'
+assert_cfy_sync_base_only "$base_only_expected" "$retained_result_checksum" "$malformed_sidecar_checksum"
+
+printf '%064d:%d\n' 0 1 > "$CFY_SOURCE_GENERATION_FILE"
+chmod 600 "$CFY_SOURCE_GENERATION_FILE"
+stale_sidecar_checksum="$(cksum < "$CFY_SOURCE_GENERATION_FILE")"
+sync_combined_subscription || fail 'stale cfy sidecar did not degrade to base-only publication'
+assert_cfy_sync_base_only "$base_only_expected" "$retained_result_checksum" "$stale_sidecar_checksum"
+
+printf '%s\n' "$initial_generation" > "$CFY_SOURCE_GENERATION_FILE"
+chmod 644 "$CFY_SOURCE_GENERATION_FILE"
+wrong_mode_checksum="$(cksum < "$CFY_SOURCE_GENERATION_FILE")"
+sync_combined_subscription || fail 'wrong-mode cfy sidecar did not degrade to base-only publication'
+assert_cfy_sync_base_only "$base_only_expected" "$retained_result_checksum" "$wrong_mode_checksum"
+[[ "$(stat -c '%a' "$CFY_SOURCE_GENERATION_FILE")" == 644 ]] || \
+    fail 'base-only publication rewrote the cfy-owned sidecar mode'
+
+sidecar_target="${fixture_dir}/sidecar-target"
+printf '%s\n' "$initial_generation" > "$sidecar_target"
+chmod 600 "$sidecar_target"
+rm -f "$CFY_SOURCE_GENERATION_FILE"
+ln -s "$sidecar_target" "$CFY_SOURCE_GENERATION_FILE"
+sync_combined_subscription || fail 'symlink cfy sidecar did not degrade to base-only publication'
+assert_cfy_sync_base_only "$base_only_expected" "$retained_result_checksum"
+[[ -L "$CFY_SOURCE_GENERATION_FILE" ]] || fail 'base-only publication replaced an untrusted sidecar symlink'
+
+rm -f "$CFY_SOURCE_GENERATION_FILE"
+printf '%s\n' "$initial_generation" > "$CFY_SOURCE_GENERATION_FILE"
+chmod 600 "$CFY_SOURCE_GENERATION_FILE"
+sync_combined_subscription || fail 'matching cfy sidecar was rejected'
+[[ "$(cat "$COMBINED_URL_FILE")" == "$expected" ]] || fail 'matching cfy result was not merged'
+
+matching_sidecar_checksum="$(cksum < "$CFY_SOURCE_GENERATION_FILE")"
+printf '%s\n' 'vless://base-after-mutation' > "$URL_FILE"
+sync_combined_subscription || fail 'base mutation with stale cfy metadata did not publish safely'
+assert_cfy_sync_base_only 'vless://base-after-mutation' "$retained_result_checksum" "$matching_sidecar_checksum"
+
+printf '%s\n' \
+    'vless://base-a' \
+    'vless://shared' \
+    'vless://same-fields#one' > "$URL_FILE"
+printf '%s\n' "$initial_generation" > "$CFY_SOURCE_GENERATION_FILE"
+chmod 600 "$CFY_SOURCE_GENERATION_FILE"
+sync_combined_subscription || fail 'could not restore the matching cfy fixture'
 
 printf '%s\n' 'old-served-generation' > "$SERVED_SUB_FILE"
 base64() { return 1; }
@@ -100,6 +180,9 @@ unset -f base64
 
 printf '%s\n' 'vless://old-result' > "$RESULT_FILE"
 printf '%s\n' 'old-served-generation' > "$SERVED_SUB_FILE"
+printf '%s\n' "$initial_generation" > "$CFY_SOURCE_GENERATION_FILE"
+chmod 600 "$CFY_SOURCE_GENERATION_FILE"
+old_sidecar_checksum="$(cksum < "$CFY_SOURCE_GENERATION_FILE")"
 generated_urls=('vless://new-result')
 RESULT_DIR="${tmp_root}/history"
 GREEN=''
@@ -114,6 +197,62 @@ unset -f base64
     fail 'cfy committed its new source before the served generation was staged'
 [[ "$(cat "$SERVED_SUB_FILE")" == old-served-generation ]] || \
     fail 'a cfy source staging failure replaced the old served generation'
+[[ "$(cksum < "$CFY_SOURCE_GENERATION_FILE")" == "$old_sidecar_checksum" ]] || \
+    fail 'a cfy staging failure replaced the old source generation sidecar'
+
+load_source_urls || fail 'could not capture generation for successful sidecar publication'
+generated_urls=('vless://fresh-cfy-result')
+save_generated_urls || fail 'cfy could not publish a fresh result with its generation sidecar'
+published_generation="$(get_subscription_source_generation "$URL_FILE")"
+[[ "$(cat "$CFY_SOURCE_GENERATION_FILE")" == "$published_generation" ]] || \
+    fail 'successful publication did not atomically record the canonical source generation'
+[[ "$(stat -c '%a' "$CFY_SOURCE_GENERATION_FILE")" == 600 ]] || \
+    fail 'successful publication did not secure its generation sidecar'
+[[ "$(cat "$COMBINED_URL_FILE")" == $'vless://base-a\nvless://shared\nvless://same-fields#one\nvless://fresh-cfy-result' ]] || \
+    fail 'fresh cfy result and sidecar did not publish as one generation'
+
+transaction_targets=(
+    "$RESULT_FILE"
+    "$CFY_SOURCE_GENERATION_FILE"
+    "$BASE_SUB_FILE"
+    "$SUB_FILE"
+    "$COMBINED_URL_FILE"
+    "$COMBINED_SUB_FILE"
+    "$SERVED_SUB_FILE"
+)
+for fail_index in "${!transaction_targets[@]}"; do
+    snapshot_dir="${tmp_root}/snapshot-${fail_index}"
+    mkdir -p "$snapshot_dir"
+    for snapshot_index in "${!transaction_targets[@]}"; do
+        cp -p -- "${transaction_targets[$snapshot_index]}" "${snapshot_dir}/${snapshot_index}"
+    done
+    load_source_urls || fail "could not capture source generation before commit failure ${fail_index}"
+    generated_urls=("vless://commit-failure-${fail_index}")
+    FAIL_TARGET="${transaction_targets[$fail_index]}"
+    FAIL_TRIGGERED=0
+    mv() {
+        local source_arg="${@: -2:1}"
+        local target_arg="${@: -1}"
+        if [[ "$FAIL_TRIGGERED" -eq 0 && "$target_arg" == "$FAIL_TARGET" && \
+              "$source_arg" == *'/.tmp.'* && "$source_arg" != *'.rollback.'* ]]; then
+            FAIL_TRIGGERED=1
+            return 1
+        fi
+        command mv "$@"
+    }
+    set +e
+    save_generated_urls >/dev/null 2>&1
+    commit_failure_status=$?
+    set -e
+    unset -f mv
+    [[ "$commit_failure_status" -eq 1 ]] || \
+        fail "commit failure ${fail_index} returned ${commit_failure_status}, expected rollback status 1"
+    [[ "$FAIL_TRIGGERED" -eq 1 ]] || fail "commit failure ${fail_index} was not injected"
+    for snapshot_index in "${!transaction_targets[@]}"; do
+        cmp -s "${transaction_targets[$snapshot_index]}" "${snapshot_dir}/${snapshot_index}" || \
+            fail "commit failure ${fail_index} did not roll back target ${snapshot_index}"
+    done
+done
 
 printf '%s\n' 'vless://old-result-before-rollback' > "$RESULT_FILE"
 generated_urls=('vless://rollback-test')
@@ -248,6 +387,7 @@ sync_combined_subscription || fail 'could not prepare the generation-drift fixtu
 load_source_urls || fail 'could not record the generation-drift source token'
 old_result_checksum="$(cksum < "$RESULT_FILE")"
 old_drift_served_checksum="$(cksum < "$SERVED_SUB_FILE")"
+old_drift_sidecar_checksum="$(cksum < "$CFY_SOURCE_GENERATION_FILE")"
 replace_base_generation() { printf '%s\n' 'vless://generation-b' > "$URL_FILE"; }
 with_subscription_lock replace_base_generation || fail 'could not simulate a concurrent Sing-box base update'
 generated_urls=('vless://stale-generated-result')
@@ -260,6 +400,8 @@ set -e
     fail 'source-generation drift replaced the previous cfy result'
 [[ "$(cksum < "$SERVED_SUB_FILE")" == "$old_drift_served_checksum" ]] || \
     fail 'source-generation drift replaced the previous served subscription'
+[[ "$(cksum < "$CFY_SOURCE_GENERATION_FILE")" == "$old_drift_sidecar_checksum" ]] || \
+    fail 'source-generation drift replaced the previous cfy generation sidecar'
 if grep -Fq '生成完毕' <<< "$drift_output"; then
     fail 'cfy printed final success after source-generation drift'
 fi
