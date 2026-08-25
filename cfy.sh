@@ -656,6 +656,17 @@ is_valid_edge_address() {
     [[ "$host" =~ ^[A-Za-z0-9.-]+(:[0-9]+)?$ ]] && [[ "$host" == *.* ]]
 }
 
+normalize_edge_latency() {
+    local latency="$1"
+
+    latency=$(printf '%s' "$latency" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+    if [[ "$latency" =~ ^([1-9][0-9]*)[[:space:]]*([mM][sS])?$ ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    return 1
+}
+
 check_deps() {
     for cmd in jq curl base64 grep sed mktemp flock sha256sum; do
         if ! command -v "$cmd" &> /dev/null; then
@@ -709,7 +720,7 @@ collect_ranked_optimized_pairs() {
         edge_ip=$(printf '%s' "$edge_ip" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
         edge_isp=$(printf '%s' "${edge_isp:-CF}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/[[:space:]]\+/_/g')
         is_valid_edge_address "$edge_ip" || continue
-        [[ "$edge_latency" =~ ^[0-9]+$ ]] || edge_latency=999999
+        edge_latency=$(normalize_edge_latency "$edge_latency") || continue
         if [[ -n "${seen_edges[$edge_ip]+x}" ]]; then
             continue
         fi
@@ -798,11 +809,12 @@ get_all_optimized_ips() {
         while IFS= read -r row || [ -n "$row" ]; do
             ip=$(printf '%s' "$row" | sed -n "s/.*data-label=\"$ip_label\">\([^<]*\)<.*/\1/p")
             isp=$(printf '%s' "$row" | sed -n "s/.*data-label=\"$isp_label\">\([^<]*\)<.*/\1/p")
-            latency=$(printf '%s' "$row" | sed -n "s/.*data-label=\"$latency_label\">\([^<]*\)<.*/\1/p" | tr -cd '0-9')
+            latency=$(printf '%s' "$row" | sed -n "s/.*data-label=\"$latency_label\">\([^<]*\)<.*/\1/p")
             ip=$(printf '%s' "$ip" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
             isp=$(printf '%s' "${isp:-CF}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/[[:space:]]\+/_/g')
             is_valid_edge_address "$ip" || continue
-            printf '%s|%s|%s\n' "$ip" "${isp:-CF}" "${latency:-999999}" >> "$paired_data_file"
+            latency=$(normalize_edge_latency "$latency") || continue
+            printf '%s|%s|%s\n' "$ip" "${isp:-CF}" "$latency" >> "$paired_data_file"
         done <<< "$table_rows"
     }
 

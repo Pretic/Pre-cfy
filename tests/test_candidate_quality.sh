@@ -19,6 +19,7 @@ fi
 source <(extract_function is_ipv6_edge)
 source <(extract_function get_edge_ip_version)
 source <(extract_function is_valid_edge_address)
+source <(extract_function normalize_edge_latency)
 source <(printf '%s\n' "${ranker_source}")
 
 fixture="$(mktemp)"
