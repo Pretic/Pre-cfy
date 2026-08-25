@@ -14,10 +14,12 @@ source <(extract_function is_ipv6_edge)
 source <(extract_function get_edge_ip_version)
 source <(extract_function is_valid_edge_address)
 source <(extract_function normalize_edge_latency)
+source <(extract_function decimal_latency_less_than)
 source <(extract_function collect_ranked_optimized_pairs)
 
 fixture="$(mktemp)"
-trap 'rm -f "${fixture}"' EXIT
+rank_stderr="$(mktemp)"
+trap 'rm -f "${fixture}" "${rank_stderr}"' EXIT
 cat > "${fixture}" <<'EOF'
 104.17.0.1|Mobile|-1
 104.17.0.2|Mobile|
@@ -25,23 +27,38 @@ cat > "${fixture}" <<'EOF'
 104.17.0.4|Mobile|0
 104.17.0.5|Mobile|45
 104.17.0.6|Mobile|20
+104.17.0.7|Mobile|1000000
+104.17.0.8|Mobile|1000001
+104.17.0.9|Mobile|999999999999999999999999999999
+104.17.0.10|Mobile|15
+104.17.0.11|Mobile|00000017
 2606:4700::1|Mobile|-1
 2606:4700::2|Mobile|
 2606:4700::3|Mobile|timed_out
 2606:4700::4|Mobile|0
 2606:4700::5|Mobile|50
 2606:4700::6|Mobile|30
+2606:4700::7|Mobile|1000000
+2606:4700::8|Mobile|1000001
+2606:4700::9|Mobile|999999999999999999999999999998
+2606:4700::10|Mobile|25
+2606:4700::11|Mobile|00000027
 EOF
 
-collect_ranked_optimized_pairs "${fixture}" 5 both
+collect_ranked_optimized_pairs "${fixture}" 10 both 2>"${rank_stderr}"
 
-expected_ips="104.17.0.6 104.17.0.5 2606:4700::6 2606:4700::5"
-if [[ "${ip_list[*]}" != "${expected_ips}" ]]; then
-    echo "FAIL: invalid or non-positive RTT candidates were selected: ${ip_list[*]}" >&2
+if [[ -s "${rank_stderr}" ]]; then
+    echo "FAIL: large decimal RTT comparison wrote to stderr: $(<"${rank_stderr}")" >&2
     exit 1
 fi
 
-if [[ "${#ip_list[@]}" -ne 4 ]]; then
+expected_ips="104.17.0.10 104.17.0.11 104.17.0.6 104.17.0.5 104.17.0.7 104.17.0.8 104.17.0.9 2606:4700::10 2606:4700::11 2606:4700::6 2606:4700::5 2606:4700::7 2606:4700::8 2606:4700::9"
+if [[ "${ip_list[*]}" != "${expected_ips}" ]]; then
+    echo "FAIL: valid decimal RTT candidates were not filtered and ranked correctly: ${ip_list[*]}" >&2
+    exit 1
+fi
+
+if [[ "${#ip_list[@]}" -ne 14 ]]; then
     echo "FAIL: sparse quality results must not be padded to the per-group limit" >&2
     exit 1
 fi

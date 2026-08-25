@@ -657,13 +657,33 @@ is_valid_edge_address() {
 }
 
 normalize_edge_latency() {
-    local latency="$1"
+    local latency="$1" digits
 
     latency=$(printf '%s' "$latency" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
-    if [[ "$latency" =~ ^([1-9][0-9]*)[[:space:]]*([mM][sS])?$ ]]; then
-        printf '%s\n' "${BASH_REMATCH[1]}"
+    [[ "$latency" =~ ^([0-9]+)[[:space:]]*([mM][sS])?$ ]] || return 1
+    digits="${BASH_REMATCH[1]}"
+    while [ "${#digits}" -gt 1 ] && [ "${digits:0:1}" = "0" ]; do
+        digits="${digits:1}"
+    done
+    [ "$digits" != "0" ] || return 1
+    printf '%s\n' "$digits"
+}
+
+decimal_latency_less_than() {
+    local left="$1" right="$2" index left_digit right_digit
+
+    if [ "${#left}" -lt "${#right}" ]; then
         return 0
+    elif [ "${#left}" -gt "${#right}" ]; then
+        return 1
     fi
+    for ((index=0; index<${#left}; index++)); do
+        left_digit="${left:index:1}"
+        right_digit="${right:index:1}"
+        [ "$left_digit" = "$right_digit" ] && continue
+        [ "$left_digit" -lt "$right_digit" ]
+        return
+    done
     return 1
 }
 
@@ -753,11 +773,11 @@ collect_ranked_optimized_pairs() {
             [ "${group##*|}" = "$desired_version" ] || continue
             for ((slot=0; slot<per_group_limit; slot++)); do
                 best_index=-1
-                best_latency=1000000
+                best_latency=''
                 for ((index=0; index<${#candidate_ips[@]}; index++)); do
                     [ "${candidate_groups[$index]}" = "$group" ] || continue
                     [[ -z "${selected_indices[$index]+x}" ]] || continue
-                    if [ "${candidate_latencies[$index]}" -lt "$best_latency" ]; then
+                    if [ "$best_index" -lt 0 ] || decimal_latency_less_than "${candidate_latencies[$index]}" "$best_latency"; then
                         best_index=$index
                         best_latency=${candidate_latencies[$index]}
                     fi

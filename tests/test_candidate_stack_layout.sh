@@ -14,6 +14,7 @@ source <(extract_function is_ipv6_edge)
 source <(extract_function get_edge_ip_version)
 source <(extract_function is_valid_edge_address)
 source <(extract_function normalize_edge_latency)
+source <(extract_function decimal_latency_less_than)
 source <(extract_function collect_ranked_optimized_pairs)
 
 fixture="$(mktemp)"
