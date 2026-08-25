@@ -177,11 +177,28 @@ show_update_done() {
     echo -e "${GREEN}更新命令不会修改 sing-box 已有节点或最近一次优选结果。${NC}"
 }
 
+check_update_dependencies() {
+    local cmd
+
+    for cmd in flock sha256sum; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            if [ "$cmd" = "flock" ]; then
+                echo -e "${RED}错误: 更新前需要命令 'flock'。Debian/Ubuntu 与 Alpine 均请安装 util-linux。${NC}"
+            else
+                echo -e "${RED}错误: 更新前需要命令 'sha256sum'，请安装 coreutils。${NC}"
+            fi
+            return 1
+        fi
+    done
+}
+
 update_self() {
     if [ "$(id -u)" -ne 0 ]; then
         echo -e "${RED}错误: 更新需要管理员权限，请使用 root 或 sudo 运行。${NC}"
         exit 1
     fi
+
+    check_update_dependencies || exit 1
 
     if ! command -v curl >/dev/null 2>&1; then
         echo -e "${RED}错误: 未找到 curl，无法从远端更新 cfy。${NC}"
