@@ -27,12 +27,19 @@ repair_served_subscription_file() {
     chmod 644 "$SERVED_SUB_FILE"
 }
 
-require_flock_dependency() {
-    if command -v flock >/dev/null 2>&1; then
-        return 0
-    fi
-    echo "错误: 未找到 flock。Debian/Ubuntu 与 Alpine 均请安装 util-linux；订阅文件未作任何修改。" >&2
-    return 1
+check_update_dependencies() {
+    local cmd
+
+    for cmd in flock sha256sum; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            if [ "$cmd" = "flock" ]; then
+                echo "错误: 安装或更新前需要命令 'flock'。Debian/Ubuntu 与 Alpine 均请安装 util-linux。" >&2
+            else
+                echo "错误: 安装或更新前需要命令 'sha256sum'，请安装 coreutils。" >&2
+            fi
+            return 1
+        fi
+    done
 }
 
 is_stdin_script() {
@@ -112,7 +119,7 @@ if [ "$0" != "$INSTALL_PATH" ]; then
         exit 1
     fi
 
-    require_flock_dependency || exit 1
+    check_update_dependencies || exit 1
 
     echo "正在将脚本写入到 $INSTALL_PATH..."
 
@@ -175,21 +182,6 @@ show_help() {
 show_update_done() {
     echo -e "${GREEN}cfy 已更新到 $INSTALL_PATH。${NC}"
     echo -e "${GREEN}更新命令不会修改 sing-box 已有节点或最近一次优选结果。${NC}"
-}
-
-check_update_dependencies() {
-    local cmd
-
-    for cmd in flock sha256sum; do
-        if ! command -v "$cmd" >/dev/null 2>&1; then
-            if [ "$cmd" = "flock" ]; then
-                echo -e "${RED}错误: 更新前需要命令 'flock'。Debian/Ubuntu 与 Alpine 均请安装 util-linux。${NC}"
-            else
-                echo -e "${RED}错误: 更新前需要命令 'sha256sum'，请安装 coreutils。${NC}"
-            fi
-            return 1
-        fi
-    done
 }
 
 update_self() {
