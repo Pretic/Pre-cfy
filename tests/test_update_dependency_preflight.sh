@@ -74,10 +74,40 @@ run_missing_dependency_case() (
         echo "FAIL: installed cfy content changed without ${missing_dependency}" >&2
         return 1
     }
+    grep -Fq "${missing_dependency}" "${case_dir}/output" || {
+        echo "FAIL: missing ${missing_dependency} diagnostic named the wrong dependency" >&2
+        return 1
+    }
 )
 
 run_missing_dependency_case flock
 run_missing_dependency_case sha256sum
+run_missing_dependency_case stat
+
+# getent is needed only when an administrator selects a named trusted group.
+command() {
+    if [[ "${1:-}" == '-v' && "${2:-}" == getent ]]; then
+        return 1
+    fi
+    builtin command "$@"
+}
+unset SING_BOX_TRANSACTION_GROUP
+check_update_dependencies || {
+    echo 'FAIL: getent was required without a trusted group' >&2
+    exit 1
+}
+SING_BOX_TRANSACTION_GROUP="$(id -g)"
+check_update_dependencies || {
+    echo 'FAIL: getent was required for a numeric trusted group' >&2
+    exit 1
+}
+SING_BOX_TRANSACTION_GROUP='cfy-named-test-group'
+if check_update_dependencies >/dev/null 2>&1; then
+    echo 'FAIL: named trusted group did not require getent' >&2
+    exit 1
+fi
+unset SING_BOX_TRANSACTION_GROUP
+unset -f command
 
 success_dir="${test_dir}/success"
 mkdir -p "${success_dir}"
@@ -233,7 +263,7 @@ run_real_entry_case() {
     }
 }
 
-for dependency in flock sha256sum; do
+for dependency in flock sha256sum stat; do
     run_real_entry_case file "${dependency}" no
     run_real_entry_case process "${dependency}" no
 done

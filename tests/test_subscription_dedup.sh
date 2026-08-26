@@ -10,7 +10,12 @@ extract_function() {
     sed -n "/^${function_name}() {/,/^}/p" "${cfy_script}"
 }
 
-source <(extract_function with_subscription_lock)
+# Deduplication is a pure publication test.  Stable/legacy lock semantics have
+# their own focused regression suite; use an isolated held-lock scope here.
+with_subscription_lock() {
+    local SUBSCRIPTION_LOCK_HELD=1
+    "$@"
+}
 source <(extract_function get_subscription_source_generation)
 source <(extract_function read_strict_subscription_generation_file)
 source <(extract_function read_cfy_source_generation_file)
@@ -28,10 +33,7 @@ SUB_FILE="${fixture_dir}/cfy-sub.txt"
 COMBINED_URL_FILE="${fixture_dir}/all-url.txt"
 COMBINED_SUB_FILE="${fixture_dir}/all-sub.txt"
 SERVED_SUB_FILE="${fixture_dir}/sub.txt"
-SUBSCRIPTION_LOCK_FILE="${fixture_dir}/.subscription.lock"
 CFY_SOURCE_GENERATION_FILE="${fixture_dir}/cfy-source.generation"
-
-flock() { return 0; }
 
 printf '%s\n' \
     'vless://base-a' \

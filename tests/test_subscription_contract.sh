@@ -26,6 +26,34 @@ load_function() {
 }
 
 for function_name in \
+    command_exists \
+    transaction_root_path \
+    transaction_expected_dir_mode \
+    transaction_expected_file_mode \
+    transaction_expected_gid \
+    validate_transaction_path_components \
+    validate_transaction_directory \
+    ensure_transaction_directory \
+    validate_transaction_regular_file \
+    ensure_transaction_regular_file \
+    write_transaction_schema_file \
+    ensure_stable_transaction_root \
+    stable_transaction_lock_path \
+    stable_transaction_lock_rank \
+    stable_transaction_lock_is_held \
+    stable_transaction_highest_rank \
+    stable_transaction_lock_hook \
+    legacy_transaction_lock_hook \
+    reset_stable_transaction_lock_state \
+    acquire_stable_transaction_lock \
+    release_stable_transaction_lock \
+    with_stable_transaction_lock \
+    validate_safe_legacy_lock \
+    acquire_safe_legacy_lock \
+    release_safe_legacy_lock \
+    acquire_transaction_lock_with_legacy \
+    release_transaction_lock_with_legacy \
+    with_transaction_lock_with_legacy \
     atomic_write_file \
     write_text_file \
     with_subscription_lock \
@@ -44,7 +72,8 @@ for function_name in \
     add_url_candidate \
     load_urls_from_file \
     load_source_urls_locked \
-    load_source_urls; do
+    load_source_urls \
+    main; do
     load_function "$function_name"
 done
 
@@ -57,8 +86,13 @@ COMBINED_URL_FILE="${fixture_dir}/all-url.txt"
 COMBINED_SUB_FILE="${fixture_dir}/all-sub.txt"
 SERVED_SUB_FILE="${fixture_dir}/sub.txt"
 SUBSCRIPTION_LOCK_FILE="${fixture_dir}/.subscription.lock"
+SING_BOX_TRANSACTION_ROOT="${tmp_root}/transactions"
+unset SING_BOX_TRANSACTION_GROUP
 CFY_SOURCE_GENERATION_FILE="${fixture_dir}/cfy-source.generation"
 BASE_SUB_FILE="${fixture_dir}/base-sub.txt"
+
+: > "$SUBSCRIPTION_LOCK_FILE"
+chmod 600 "$SUBSCRIPTION_LOCK_FILE"
 
 printf '%s\n' \
     'vless://base-a' \
@@ -425,5 +459,15 @@ grep -Fq '发布失败' <<< "$finalize_output" || \
 main_source="$(extract_function main)"
 grep -Fq 'finalize_generated_urls "$num_to_generate" || return $?' <<< "$main_source" || \
     fail 'cfy main does not propagate final publication failure'
+
+# Stable-lock initialization failures are contract failures (rc=2), not an
+# ordinary missing-template result (rc=1).
+eval 'load_source_urls() { return 2; }'
+set +e
+main >/dev/null 2>&1
+main_lock_status=$?
+set -e
+[[ "$main_lock_status" -eq 2 ]] || \
+    fail "cfy main folded an initial lock failure into status ${main_lock_status}"
 
 printf 'cfy subscription contract tests passed.\n'

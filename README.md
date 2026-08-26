@@ -31,6 +31,8 @@
 * 合并基础节点与 cfy 优选节点时，会按首次出现顺序移除完全相同的链接；不同备注或不同连接字段的节点不会被合并。
 * 合并后的 Base64 订阅写入 `/etc/sing-box/all-sub.txt`，并同步覆盖 `/etc/sing-box/sub.txt`，因此原来的 Nginx 订阅地址会自动包含优选节点。
 * 内部订阅文件默认保持 `0600`；只有 Nginx 实际发布的 `/etc/sing-box/sub.txt` 使用 `0644`，避免 Nginx 非 root 工作进程在 cfy 更新后因无读取权限返回 403。安装或更新 cfy 时也会自动修复既有发布文件的权限，不改写订阅内容。
+* cfy 与 Sing-box 先共同锁定 `/var/lib/sing-box-transactions/subscription.lock`，再兼容锁定已存在且安全的旧 `.subscription.lock`；旧锁不存在时不会创建。稳定锁文件是版本化、固定 inode 的控制面锚点，异常对象或释放状态不确定时会失败关闭。
+* 这套锁只在读取或发布订阅的短事务内使用，不进入 sing-box 的数据转发路径，因此不会增加节点日常流量，也没有持续的数据面性能开销。
 * 如果还没有运行过 cfy，Sing-box 的订阅地址仍只包含基础节点，不会因为没有优选结果而失效。
 
 ## NAT 机使用说明
@@ -107,11 +109,14 @@ cfy
 * `jq`: 用于解析 JSON 数据。
 * `curl`: 用于发起网络请求。
 * `coreutils`: 提供 `base64`, `mktemp` 等基础命令。
+* `util-linux`: 提供跨进程订阅锁所需的 `flock`。
+* `stat`: 用于校验稳定锁目录和 inode；通常由 `coreutils` 提供。
 * `grep`, `sed`: 用于文本处理。
+* 只有设置了名称形式的 `SING_BOX_TRANSACTION_GROUP` 时才需要 `getent`；未设置或使用数字 GID 时不要求它。
 
 **在 Debian / Ubuntu 系统中安装:**
 ```bash
-apt update && apt install -y jq curl coreutils grep sed sudo
+apt update && apt install -y jq curl coreutils util-linux grep sed sudo
 ```
 
 ## 一键新装与运行
