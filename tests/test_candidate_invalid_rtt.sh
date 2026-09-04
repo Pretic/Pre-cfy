@@ -13,6 +13,9 @@ extract_function() {
 source <(extract_function is_ipv6_edge)
 source <(extract_function get_edge_ip_version)
 source <(extract_function is_valid_edge_address)
+source <(extract_function is_valid_ipv4_literal)
+source <(extract_function is_valid_ipv6_literal)
+source <(extract_function is_valid_optimized_ip_literal)
 source <(extract_function normalize_edge_latency)
 source <(extract_function decimal_latency_less_than)
 source <(extract_function collect_ranked_optimized_pairs)
@@ -80,6 +83,8 @@ curl() {
     case "${url}" in
         *address_v4.html)
             printf '%s\n' \
+                '<tr><td data-label="优选地址">999.999.999.999</td><td data-label="线路名称">Mobile</td><td data-label="往返延迟">1 ms</td></tr>' \
+                '<tr><td data-label="优选地址">2606:4700:1::99</td><td data-label="线路名称">Mobile</td><td data-label="往返延迟">1 ms</td></tr>' \
                 '<tr><td data-label="优选地址">104.18.0.1</td><td data-label="线路名称">Mobile</td><td data-label="往返延迟">-1 ms</td></tr>' \
                 '<tr><td data-label="优选地址">104.18.0.2</td><td data-label="线路名称">Mobile</td><td data-label="往返延迟"></td></tr>' \
                 '<tr><td data-label="优选地址">104.18.0.3</td><td data-label="线路名称">Mobile</td><td data-label="往返延迟">timeout</td></tr>' \
@@ -90,6 +95,8 @@ curl() {
             ;;
         *address_v6.html)
             printf '%s\n' \
+                '<tr><td data-label="优选地址">1::2:</td><td data-label="线路名称">Mobile</td><td data-label="往返延迟">1 ms</td></tr>' \
+                '<tr><td data-label="优选地址">104.18.0.99</td><td data-label="线路名称">Mobile</td><td data-label="往返延迟">1 ms</td></tr>' \
                 '<tr><td data-label="优选地址">2606:4700:1::1</td><td data-label="线路名称">Mobile</td><td data-label="往返延迟">-1 ms</td></tr>' \
                 '<tr><td data-label="优选地址">2606:4700:1::2</td><td data-label="线路名称">Mobile</td><td data-label="往返延迟"></td></tr>' \
                 '<tr><td data-label="优选地址">2606:4700:1::3</td><td data-label="线路名称">Mobile</td><td data-label="往返延迟">timed out</td></tr>' \

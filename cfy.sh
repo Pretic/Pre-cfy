@@ -27,6 +27,8 @@ CFY_SOURCE_GENERATION_FILE="${CFY_SOURCE_GENERATION_FILE:-/etc/sing-box/cfy-sour
 RESULT_DIR="${RESULT_DIR:-/etc/sing-box/cfy-results}"
 CFY_CURL_CONNECT_TIMEOUT="${CFY_CURL_CONNECT_TIMEOUT:-10}"
 CFY_CURL_MAX_TIME="${CFY_CURL_MAX_TIME:-30}"
+CFY_OPTIMIZED_IP_API_URL="${CFY_OPTIMIZED_IP_API_URL:-https://www.wetest.vip/api/cf2dns/get_cloudflare_ip}"
+CFY_OPTIMIZED_IP_API_KEY="${CFY_OPTIMIZED_IP_API_KEY:-o1zrmHAF}"
 CFY_IP_VERSION_SCOPE="${CFY_IP_VERSION_SCOPE:-}"
 CFY_PER_ISP_LIMIT="${CFY_PER_ISP_LIMIT:-}"
 CFY_HEALTH_PROBE="${CFY_HEALTH_PROBE:-0}"
@@ -1206,6 +1208,64 @@ is_valid_edge_address() {
     [[ "$host" =~ ^[A-Za-z0-9.-]+(:[0-9]+)?$ ]] && [[ "$host" == *.* ]]
 }
 
+is_valid_ipv4_literal() {
+    local address="$1" octet
+    local -a octets
+
+    [[ "$address" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    IFS='.' read -r -a octets <<< "$address"
+    [ "${#octets[@]}" -eq 4 ] || return 1
+    for octet in "${octets[@]}"; do
+        (( 10#$octet <= 255 )) || return 1
+    done
+}
+
+is_valid_ipv6_literal() {
+    local address="$1" left right remainder segment
+    local count=0
+    local -a groups
+
+    [[ "$address" =~ ^[0-9A-Fa-f:]+$ ]] && [[ "$address" == *:* ]] || return 1
+    [[ "$address" != *:::* ]] || return 1
+    [[ "$address" != :* || "$address" == ::* ]] || return 1
+    [[ "$address" != *: || "$address" == *:: ]] || return 1
+
+    if [[ "$address" == *"::"* ]]; then
+        remainder="${address#*::}"
+        [[ "$remainder" != *"::"* ]] || return 1
+        left="${address%%::*}"
+        right="${address#*::}"
+        for remainder in "$left" "$right"; do
+            [ -n "$remainder" ] || continue
+            IFS=':' read -r -a groups <<< "$remainder"
+            for segment in "${groups[@]}"; do
+                [[ "$segment" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+                count=$((count + 1))
+            done
+        done
+        [ "$count" -lt 8 ]
+        return
+    fi
+
+    [[ "$address" != :* && "$address" != *: ]] || return 1
+    IFS=':' read -r -a groups <<< "$address"
+    [ "${#groups[@]}" -eq 8 ] || return 1
+    for segment in "${groups[@]}"; do
+        [[ "$segment" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+    done
+}
+
+is_valid_optimized_ip_literal() {
+    local address="$1" expected_version="${2:-both}"
+
+    case "$expected_version" in
+        ipv4) is_valid_ipv4_literal "$address" ;;
+        ipv6) is_valid_ipv6_literal "$address" ;;
+        both) is_valid_ipv4_literal "$address" || is_valid_ipv6_literal "$address" ;;
+        *) return 1 ;;
+    esac
+}
+
 normalize_edge_latency() {
     local latency="$1" digits
 
@@ -1359,17 +1419,80 @@ get_candidate_group_limit() {
     fi
 }
 
+parse_wetest_api_payload() {
+    local payload="$1"
+    local target_file="$2"
+    local expected_version="${3:-both}"
+    local rows ip isp latency normalized_latency actual_version normalized_isp
+    local appended=0
+
+    rows=$(printf '%s' "$payload" | jq -r '
+        def candidate_row($fallback):
+            [
+                (.ip // ""),
+                (.line_name // .line // $fallback),
+                ((.rtt_avg // .latency // "")
+                    | if type == "number" then (. * 1000 | round) else . end)
+            ]
+            | @tsv;
+        if (.status == true and ((.code | tostring) == "200")) then
+            if ((.info | type) == "object") then
+                .info
+                | to_entries[]
+                | select(.key == "CM" or .key == "CU" or .key == "CT")
+                | .key as $group
+                | select((.value | type) == "array")
+                | .value[]
+                | select(type == "object")
+                | candidate_row($group)
+            elif ((.info | type) == "array") then
+                .info[]
+                | select(type == "object")
+                | candidate_row("CF")
+            else
+                empty
+            end
+        else
+            empty
+        end
+    ' 2>/dev/null) || return 1
+
+    while IFS=$'\t' read -r ip isp latency || [ -n "$ip" ]; do
+        ip=$(printf '%s' "$ip" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+        isp=$(printf '%s' "${isp:-CF}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/[[:space:]|]\+/_/g')
+        is_valid_optimized_ip_literal "$ip" "$expected_version" || continue
+        actual_version=$(get_edge_ip_version "$ip")
+        case "$expected_version" in
+            ipv4|ipv6) [ "$actual_version" = "$expected_version" ] || continue ;;
+        esac
+        normalized_latency=$(normalize_edge_latency "$latency") || continue
+        normalized_isp=$(printf '%s' "$isp" | tr '[:upper:]' '[:lower:]')
+        case "$normalized_isp" in
+            cm) isp="Mobile" ;;
+            cu) isp="Unicom" ;;
+            ct) isp="Telecom" ;;
+        esac
+        printf '%s|%s|%s\n' "$ip" "${isp:-CF}" "$normalized_latency" >> "$target_file"
+        appended=$((appended + 1))
+    done <<< "$rows"
+
+    [ "$appended" -gt 0 ]
+}
+
 get_all_optimized_ips() {
     local url_v4="https://www.wetest.vip/page/cloudflare/address_v4.html"
     local url_v6="https://www.wetest.vip/page/cloudflare/address_v6.html"
+    local api_url="${CFY_OPTIMIZED_IP_API_URL:-https://www.wetest.vip/api/cf2dns/get_cloudflare_ip}"
+    local api_key="${CFY_OPTIMIZED_IP_API_KEY:-o1zrmHAF}"
 
     echo -e "${YELLOW}Fetching optimized IP list (IPv4 & IPv6)...${NC}"
 
     local paired_data_file
     paired_data_file=$(mktemp) || return 1
 
-    parse_url() {
-        local url="$1" type_desc="$2" html_content table_rows row ip isp latency
+    parse_html_url() {
+        local url="$1" type_desc="$2" expected_version="$3"
+        local html_content table_rows row ip isp latency
         local ip_label=$'\344\274\230\351\200\211\345\234\260\345\235\200'
         local isp_label=$'\347\272\277\350\267\257\345\220\215\347\247\260'
         local latency_label=$'\345\276\200\350\277\224\345\273\266\350\277\237'
@@ -1388,14 +1511,34 @@ get_all_optimized_ips() {
             latency=$(printf '%s' "$row" | sed -n "s/.*data-label=\"$latency_label\">\([^<]*\)<.*/\1/p")
             ip=$(printf '%s' "$ip" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
             isp=$(printf '%s' "${isp:-CF}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/[[:space:]]\+/_/g')
-            is_valid_edge_address "$ip" || continue
+            is_valid_optimized_ip_literal "$ip" "$expected_version" || continue
             latency=$(normalize_edge_latency "$latency") || continue
             printf '%s|%s|%s\n' "$ip" "${isp:-CF}" "$latency" >> "$paired_data_file"
         done <<< "$table_rows"
     }
 
-    parse_url "$url_v4" "IPv4"
-    parse_url "$url_v6" "IPv6"
+    fetch_family() {
+        local api_type="$1" expected_version="$2" html_url="$3" type_desc="$4" api_content
+
+        echo -e "  -> Fetching ${type_desc} list..."
+        api_content=$(curl -fsSL \
+            --connect-timeout "$CFY_CURL_CONNECT_TIMEOUT" \
+            --max-time "$CFY_CURL_MAX_TIME" \
+            --get \
+            --data-urlencode "key=${api_key}" \
+            --data-urlencode "type=${api_type}" \
+            "$api_url" 2>/dev/null || true)
+        if [ -n "$api_content" ] && \
+           parse_wetest_api_payload "$api_content" "$paired_data_file" "$expected_version"; then
+            return 0
+        fi
+
+        echo -e "${YELLOW}  -> ${type_desc} API unavailable or invalid; trying the page fallback.${NC}"
+        parse_html_url "$html_url" "${type_desc} fallback" "$expected_version"
+    }
+
+    fetch_family "v4" "ipv4" "$url_v4" "IPv4"
+    fetch_family "v6" "ipv6" "$url_v6" "IPv6"
 
     if ! [ -s "$paired_data_file" ]; then
         rm -f "$paired_data_file"
