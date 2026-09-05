@@ -87,6 +87,7 @@ fixture_schema=object
 
 curl() {
     local args=" $* "
+    [[ -z "${request_log:-}" ]] || printf '%s\n' "$args" >> "$request_log"
 
     [[ "${args}" == *" ${CFY_OPTIMIZED_IP_API_URL} "* ]] || return 22
     if [[ "${args}" == *" type=v4 "* ]]; then
@@ -154,4 +155,17 @@ if [[ "${isp_list[*]}" != "${expected_isps}" ]]; then
     exit 1
 fi
 
-echo 'WeTest optimized-IP API parsing tests passed.'
+request_log=$(mktemp)
+trap 'rm -f "${output_file}" "${request_log}"' EXIT
+for IP_VERSION_SCOPE in ipv4 ipv6; do
+    : > "$request_log"
+    get_all_optimized_ips > "$output_file"
+    [[ $(wc -l < "$request_log") -eq 1 ]] || {
+        echo "FAIL: ${IP_VERSION_SCOPE} scope fetched an unused IP family" >&2
+        exit 1
+    }
+    case "$IP_VERSION_SCOPE" in ipv4) expected_type=v4 ;; ipv6) expected_type=v6 ;; esac
+    grep -q "type=${expected_type} " "$request_log"
+done
+
+echo 'WeTest optimized-IP API parsing and fetch scope tests passed.'

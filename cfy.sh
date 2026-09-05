@@ -1496,7 +1496,11 @@ get_all_optimized_ips() {
     local api_url="${CFY_OPTIMIZED_IP_API_URL:-https://www.wetest.vip/api/cf2dns/get_cloudflare_ip}"
     local api_key="${CFY_OPTIMIZED_IP_API_KEY:-o1zrmHAF}"
 
-    echo -e "${YELLOW}Fetching optimized IP list (IPv4 & IPv6)...${NC}"
+    case "$IP_VERSION_SCOPE" in
+        ipv4|ipv6|both) ;;
+        *) echo -e "${RED}Invalid IP scope: ${IP_VERSION_SCOPE}.${NC}"; return 1 ;;
+    esac
+    echo -e "${YELLOW}Fetching optimized IP list (scope ${IP_VERSION_SCOPE})...${NC}"
 
     local paired_data_file
     paired_data_file=$(mktemp) || return 1
@@ -1548,8 +1552,12 @@ get_all_optimized_ips() {
         parse_html_url "$html_url" "${type_desc} fallback" "$expected_version"
     }
 
-    fetch_family "v4" "ipv4" "$url_v4" "IPv4"
-    fetch_family "v6" "ipv6" "$url_v6" "IPv6"
+    if [ "$IP_VERSION_SCOPE" != ipv6 ]; then
+        fetch_family "v4" "ipv4" "$url_v4" "IPv4"
+    fi
+    if [ "$IP_VERSION_SCOPE" != ipv4 ]; then
+        fetch_family "v6" "ipv6" "$url_v6" "IPv6"
+    fi
 
     if ! [ -s "$paired_data_file" ]; then
         rm -f "$paired_data_file"
