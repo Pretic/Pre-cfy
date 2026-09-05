@@ -81,6 +81,16 @@ is_process_substitution_script() {
     [[ "$0" == /dev/fd/* || "$0" == /proc/*/fd/* ]]
 }
 
+drain_bootstrap_input() {
+    # Bash executes this installer before the download has necessarily finished.
+    # Consume the remaining stream before exit/exec closes curl's output pipe.
+    if is_process_substitution_script; then
+        cat -- "$0" >/dev/null
+    elif is_stdin_script && [ ! -t 0 ]; then
+        cat >/dev/null
+    fi
+}
+
 install_from_remote() {
     if ! command -v curl >/dev/null 2>&1; then
         echo "错误: 未找到 curl，无法从远端安装 cfy。"
@@ -148,6 +158,7 @@ if [ "$0" != "$INSTALL_PATH" ]; then
     echo "正在将脚本写入到 $INSTALL_PATH..."
 
     if is_stdin_script || is_process_substitution_script; then
+        drain_bootstrap_input || exit 1
         install_from_remote || exit 1
     else
         if ! cp "$0" "$INSTALL_PATH"; then
@@ -1270,7 +1281,7 @@ normalize_edge_latency() {
     local latency="$1" digits
 
     latency=$(printf '%s' "$latency" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
-    [[ "$latency" =~ ^([0-9]+)[[:space:]]*([mM][sS])?$ ]] || return 1
+    [[ "$latency" =~ ^([0-9]+)[[:space:]]*([mM][sS]|毫秒)?$ ]] || return 1
     digits="${BASH_REMATCH[1]}"
     while [ "${#digits}" -gt 1 ] && [ "${digits:0:1}" = "0" ]; do
         digits="${digits:1}"
