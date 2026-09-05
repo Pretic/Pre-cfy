@@ -263,6 +263,13 @@ update_self() {
 }
 
 show_saved_results() {
+    with_subscription_lock show_saved_results_locked
+}
+
+show_saved_results_locked() {
+    local current_generation saved_generation
+
+    [ "${SUBSCRIPTION_LOCK_HELD:-0}" = 1 ] || return 1
     if [ ! -s "$RESULT_FILE" ]; then
         echo -e "${YELLOW}尚未找到已保存的优选节点，请先运行 cfy 生成一次。${NC}"
         if show_source_templates; then
@@ -272,12 +279,21 @@ show_saved_results() {
         return 1
     fi
 
-    echo -e "${GREEN}=== 最近一次优选节点 ===${NC}"
+    if ! { [ -f "$RESULT_FILE" ] && [ ! -L "$RESULT_FILE" ] &&
+        current_generation=$(get_subscription_source_generation) &&
+        saved_generation=$(read_cfy_source_generation_file) &&
+        [ "$current_generation" = "$saved_generation" ]; }; then
+        echo -e "${YELLOW}优选结果已过期或无法核对：基础节点可能已变化，请重新运行 cfy。旧结果不会加入当前订阅。${NC}"
+        return 1
+    fi
+
+    echo -e "${GREEN}=== 当前优选节点 ===${NC}"
     cat "$RESULT_FILE"
     echo ""
     [ -s "$SUB_FILE" ] && echo -e "${GREEN}Base64订阅文件: ${SUB_FILE}${NC}"
     [ -s "$COMBINED_SUB_FILE" ] && echo -e "${GREEN}综合订阅文件: ${COMBINED_SUB_FILE} -> ${SERVED_SUB_FILE}${NC}"
     [ -d "$RESULT_DIR" ] && echo -e "${GREEN}历史结果目录: ${RESULT_DIR}${NC}"
+    return 0
 }
 
 command_exists() {
