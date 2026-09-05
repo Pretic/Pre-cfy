@@ -1325,7 +1325,10 @@ decimal_latency_less_than() {
 }
 
 check_deps() {
-    for cmd in jq curl base64 grep sed mktemp flock sha256sum stat; do
+    local cmd
+    local -a required_commands=(jq curl base64 grep sed mktemp flock sha256sum stat)
+    [ "${CFY_HEALTH_PROBE:-0}" = 0 ] || required_commands+=(openssl)
+    for cmd in "${required_commands[@]}"; do
         if ! command -v "$cmd" &> /dev/null; then
             if [ "$cmd" = flock ]; then
                 echo -e "${RED}错误: 命令 'flock' 未找到。Debian/Ubuntu 与 Alpine 均请安装 util-linux.${NC}"
@@ -1823,10 +1826,43 @@ normalize_edge_input() {
     fi
 }
 
+validate_websocket_probe_headers() {
+    local header_file="$1" expected_accept="$2"
+
+    awk -v expected="$expected_accept" '
+        {
+            sub(/\r$/, "")
+            if ($0 ~ /^HTTP\/[0-9.]+[ \t]+[0-9]+/) {
+                status = $2; upgrade = ""; connection = ""; accept = ""
+                accept_count = 0; unrequested = 0
+                next
+            }
+            if (status != 101) next
+            if ($0 == "") {
+                valid = (tolower(upgrade) == "websocket" &&
+                    tolower(connection) ~ /(^|,)[ \t]*upgrade[ \t]*(,|$)/ &&
+                    accept_count == 1 && accept == expected && !unrequested)
+                exit
+            }
+            separator = index($0, ":")
+            if (!separator) next
+            name = tolower(substr($0, 1, separator - 1))
+            value = substr($0, separator + 1)
+            sub(/^[ \t]+/, "", value); sub(/[ \t]+$/, "", value)
+            if (name == "upgrade") upgrade = value
+            if (name == "connection") connection = connection "," value
+            if (name == "sec-websocket-accept") { accept = value; accept_count++ }
+            if (name == "sec-websocket-protocol" || name == "sec-websocket-extensions") unrequested = 1
+        }
+        END { exit !valid }
+    ' "$header_file"
+}
+
 probe_vless_edge_candidate() {
     local original_url="$1"
     local edge_address="$2"
-    local host sni path port tls_host request_host resolve_address result status
+    local host sni path port tls_host request_host resolve_address status
+    local header_file ws_key expected_accept curl_status
     local attempts="${CFY_HEALTH_PROBE_ATTEMPTS:-2}"
     local minimum_success="${CFY_HEALTH_MIN_SUCCESS:-2}"
     local success_count=0 attempt
@@ -1850,19 +1886,36 @@ probe_vless_edge_candidate() {
         resolve_address="[$EDGE_HOST]"
     fi
 
+    header_file=$(mktemp) || return 1
     for ((attempt=1; attempt<=attempts; attempt++)); do
-        result=$(curl --http1.1 --silent --output /dev/null \
+        ws_key=$(openssl rand -base64 16 2>/dev/null) || { rm -f "$header_file"; return 1; }
+        [[ "$ws_key" =~ ^[A-Za-z0-9+/]{22}==$ ]] || { rm -f "$header_file"; return 1; }
+        expected_accept=$(set -o pipefail
+            printf '%s' "${ws_key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11" |
+                openssl dgst -sha1 -binary | openssl base64 -A
+        ) || { rm -f "$header_file"; return 1; }
+        : > "$header_file"
+        curl_status=0
+        status=$(curl -q --noproxy '*' --retry 0 --proto '=https' --http1.1 --silent --output /dev/null \
+            --dump-header "$header_file" \
             --connect-timeout "${CFY_HEALTH_CONNECT_TIMEOUT:-3}" \
             --max-time "${CFY_HEALTH_MAX_TIME:-5}" \
             --resolve "${tls_host}:${EDGE_PORT}:${resolve_address}" \
             --header "Host: ${request_host}" \
-            --write-out '%{http_code}|%{time_starttransfer}' \
-            "https://${tls_host}:${EDGE_PORT}${path}" 2>/dev/null || true)
-        status="${result%%|*}"
-        if [ "$status" = "400" ]; then
+            --header 'Connection: Upgrade' \
+            --header 'Upgrade: websocket' \
+            --header 'Sec-WebSocket-Version: 13' \
+            --header "Sec-WebSocket-Key: ${ws_key}" \
+            --write-out '%{http_code}' \
+            "https://${tls_host}:${EDGE_PORT}${path}" 2>/dev/null) || curl_status=$?
+        # A successful upgrade leaves the socket open. A time limit reached
+        # after complete, validated 101 headers is expected, not a failed handshake.
+        if { [ "$curl_status" -eq 0 ] || [ "$curl_status" -eq 28 ]; } &&
+           [ "$status" = 101 ] && validate_websocket_probe_headers "$header_file" "$expected_accept"; then
             success_count=$((success_count + 1))
         fi
     done
+    rm -f "$header_file"
 
     [ "$success_count" -ge "$minimum_success" ]
 }
