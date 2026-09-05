@@ -1,181 +1,187 @@
-# Pre-cfy：Cloudflare 节点优选
+# Pre-cfy
 
-`cfy` 是面向 Sing-box-Pre 订阅的独立 Cloudflare 边缘入口生成器。它优先读取 VLESS-WS-TLS-Argo 模板，只替换入口地址、端口和节点备注，不改变 UUID、Host、SNI、Path、TLS 等连接参数；找不到 VLESS 模板时，才使用旧 VMess 模板兼容路径。
+给现有 Argo 节点生成一组 Cloudflare 优选入口，方便你在客户端选择更适合当前网络的节点。
 
-本仓库从 [byJoey/cfy](https://github.com/byJoey/cfy) 演进而来，现由本仓库独立维护，不代表上游项目。
+**使用前先准备一个可以连接的 WS-TLS-Argo 节点。** cfy 不负责搭建节点服务，也不能代替 Argo 隧道；它保留原节点的连接信息，只调整 Cloudflare 入口和节点名称。
 
-## 主要特性
+如果还没有安装节点，先看 [Sing-box-Pre 安装说明](https://github.com/Pretic/Sing-box-Pre#readme)。
 
-- 从 `/etc/sing-box/url.txt` 读取基础模板，避免把旧优选结果再次当成输入。
-- 支持域名、IPv4、IPv6、`host:port` 和 `[IPv6]:port` 形式的 Cloudflare 入口。
-- 提供 Cloudflare 官方 IPv4 随机生成和第三方低 RTT 优选两种模式。
-- 对第三方结果校验地址与 RTT，过滤 `-1`、超时、空值、零值及无效记录；重复 IP 只保留数据源第一次出现的记录。
-- 按“运营商 × IP 版本”分别排序，始终先输出 IPv4，再输出 IPv6。
-- 质量优先：候选不足时按实际有效数量输出，不使用无效地址补足上限。
-- 识别中国电信、中国联通、中国移动；节点名保留协议、运营商、IP 版本和序号信息。
-- 使用发布锁、同目录临时文件、原子替换和回滚，生成失败时保留最近一次成功结果。
-- 与 Sing-box-Pre 共用稳定订阅事务锁，但不进入代理数据转发路径，不影响节点日常速度。
+## 开始使用
 
-## 候选数量与地址族
+### 已安装 Sing-box-Pre
 
-默认根据 VPS 实际出站能力选择范围：
-
-| VPS 出站能力 | 每个运营商默认输出 | 顺序 |
-| --- | --- | --- |
-| IPv4 单栈 | 最多 5 个 IPv4 | IPv4 |
-| IPv6 单栈 | 最多 5 个 IPv6 | IPv6 |
-| IPv4 + IPv6 双栈 | 最多 3 个 IPv4 + 3 个 IPv6 | IPv4 在前，IPv6 在后 |
-
-这里的数量是上限，不是必须凑满的配额。例如某运营商只有 2 个带有效 RTT 的候选，就只输出 2 个。可通过 `CFY_IP_VERSION_SCOPE` 覆盖自动检测，通过 `CFY_PER_ISP_LIMIT` 覆盖每个“运营商 × 地址族”的上限。
-
-第三方 RTT 来自数据源所在的测量环境，只适合初筛，不等同于最终客户端到节点的实际延迟。脚本默认不从 VPS 对所有候选做强制健康探测，因为 VPS 路由与最终客户端路由可能完全不同，容易误删客户端可用地址。
-
-云优选先读取微测网 JSON API，某个地址族的 API 不可用时回退到对应网页。网页中的 `ms` 和 `毫秒` 延迟单位均可识别；负数、零值及无效记录仍会被过滤。若所有来源均不可用，保留最近一次成功结果。
-
-## 安装与使用
-
-### 首次安装并运行
-
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/Pre-cfy/main/cfy.sh)
-```
-
-安装后可直接运行：
-
-```bash
-cfy
-```
-
-### 查看最近一次结果
-
-```bash
-cfy -c
-```
-
-### 仅更新 cfy
-
-```bash
-cfy --update
-```
-
-通过 `bash <(curl ...) --update` 或 `curl ... | bash` 安装时，脚本会读完下载流后再退出或启动安装后的命令，避免提前关闭管道引起 `curl: (23) Failure writing output`。
-
-也可以从远端脚本更新：
-
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/Pre-cfy/main/cfy.sh) --update
-```
-
-更新只替换 `/usr/local/bin/cfy`，不会启动新一轮优选，也不会修改基础节点或最近一次成功结果。
-
-### 卸载
-
-```bash
-sudo rm /usr/local/bin/cfy
-```
-
-卸载命令本身不会删除 `/etc/sing-box` 中已有的基础节点、优选结果和历史结果。
-
-## 与 Sing-box-Pre 联动
-
-cfy 始终是独立模块，保留独立仓库、命令和更新周期。Sing-box-Pre 只提供低风险入口联动：
+在 VPS 中运行 `sb`，进入：
 
 ```text
-sb → 11. Cloudflare优选
+11. Cloudflare优选 → 1. 运行 cfy 节点优选
 ```
 
-也可直接运行：
+也可用下面的命令打开同一菜单：
 
 ```bash
 sb --cfy
 ```
 
-- 已安装 `/usr/local/bin/cfy` 时直接以前台交互方式运行。
-- 未安装时，sb 从固定且经过摘要校验的稳定版本安全安装，成功后再进入 cfy。
-- cfy 退出后返回 sb 的 Cloudflare 优选子菜单，不退出 sing-box 管理脚本。
-- cfy 下载、安装或运行失败，不重启 sing-box、Argo、Nginx，不修改端口、基础节点或已有代理服务。
-- 两个项目保持代码边界；sb 不复制 cfy 的候选解析和节点生成逻辑。
+未安装 cfy 时，sb 会先安装。cfy 运行结束后会回到菜单。
 
-## 订阅文件契约
+### 单独安装 cfy
 
-| 文件 | 所有者与用途 |
-| --- | --- |
-| `/etc/sing-box/url.txt` | Sing-box-Pre 管理的基础节点，也是 cfy 的模板来源。 |
-| `/etc/sing-box/cfy-url.txt` | cfy 最近一次成功生成的明文优选节点。 |
-| `/etc/sing-box/cfy-sub.txt` | cfy 优选节点的 Base64 订阅。 |
-| `/etc/sing-box/cfy-source.generation` | 记录生成时的基础订阅代际，格式为 `sha256(url.txt):字节数`。 |
-| `/etc/sing-box/all-url.txt` | 基础节点与当前有效 cfy 节点的合并明文。 |
-| `/etc/sing-box/all-sub.txt` | 综合 Base64 订阅。 |
-| `/etc/sing-box/sub.txt` | Nginx 实际发布的综合订阅，权限为 `0644`。 |
-| `/etc/sing-box/cfy-results/` | 按时间保存的历史结果，不参与当前订阅代际判断。 |
-
-除 Nginx 读取的 `sub.txt` 外，内部订阅与代际文件默认使用 `0600`。cfy 与 Sing-box-Pre 在短事务内共同锁定 `/var/lib/sing-box-transactions/subscription.lock`，防止同时发布造成文件交叉覆盖。
-
-如果基础订阅、UUID、Argo 域名或入口配置发生变化，代际记录会失配。此时旧 cfy 结果仍可通过 `cfy -c` 查看，但不会混入公开综合订阅；重新成功运行 cfy 后才恢复并入。发布过程中任一步骤失败，旧结果、代际记录和公开订阅会一并回滚，不留下部分更新状态。
-
-## NAT VPS 与单栈环境
-
-- cfy 不新增 VPS 入站监听端口，只生成客户端使用的 Cloudflare 入口地址。
-- 端口受限 NAT VPS 可以优先使用 WS-TLS-Argo/cfy 节点，不要求服务商额外映射 Argo 本地回环端口。
-- 只有内网 IPv4、但可正常 IPv4 出网的 NAT VPS，会按 IPv4 单栈处理。
-- VPS 没有 IPv6，但最终客户端有 IPv6 时，可显式使用 `CFY_IP_VERSION_SCOPE=both cfy` 生成双栈候选；能否使用取决于客户端网络和客户端软件。
-- Nginx 订阅端口未映射时，订阅 URL 可能无法从公网访问，但 `cfy -c` 和 `cfy-url.txt` 中的结果仍可使用。
-
-## 可选参数
-
-| 变量 | 默认值 | 说明 |
-| --- | --- | --- |
-| `CFY_IP_VERSION_SCOPE` | 自动检测 | `ipv4`、`ipv6` 或 `both`。 |
-| `CFY_PER_ISP_LIMIT` | 双栈 3，单栈 5 | 每个运营商、每个地址族的候选上限。 |
-| `CFY_NAME_PREFIX` | 从模板备注派生 | 仅覆盖本次运行的节点名前缀，不做持久化改名。 |
-| `CFY_HEALTH_PROBE` | `0` | 设为 `1` 时，对真实 SNI、Host 和 WebSocket Path 做轻量 HTTPS 探测。 |
-| `CFY_HEALTH_PROBE_ATTEMPTS` | `2` | 单个候选探测次数。 |
-| `CFY_HEALTH_MIN_SUCCESS` | `2` | 候选保留所需的最少成功次数。 |
-| `CFY_HEALTH_CONNECT_TIMEOUT` | `3` | 健康探测连接超时，单位秒。 |
-| `CFY_HEALTH_MAX_TIME` | `5` | 单次健康探测总超时，单位秒。 |
-| `CFY_CURL_CONNECT_TIMEOUT` | `10` | 拉取候选数据源的连接超时，单位秒。 |
-| `CFY_CURL_MAX_TIME` | `30` | 拉取候选数据源的总超时，单位秒。 |
-
-示例：
+通过 SSH 登录已有节点的 VPS，使用 root 用户执行：
 
 ```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/Pre-cfy/main/cfy.sh)
+```
+
+之后直接运行：
+
+```bash
+cfy
+```
+
+cfy 默认从 Sing-box-Pre 的基础节点中选择模板，优先使用 VLESS-WS-TLS-Argo，也兼容旧 VMess-WS-TLS-Argo 节点。
+
+## 生成一次优选节点
+
+1. **选择原节点。** 只有一个有效节点时，脚本会自动选中。
+2. **选择 IP 来源。** 下面的表格说明两种方式的区别。
+3. **等待生成结果。** 成功后会显示新节点，并更新 VPS 上的综合订阅。
+4. **更新客户端订阅，再测试连接。** 也可以直接复制生成的单个节点链接导入。
+
+| 菜单选项 | 会做什么 |
+| --- | --- |
+| `1. Cloudflare 官方（手动优选）` | 从官方 IPv4 地址范围随机生成指定数量的节点，没有自动测速，需要在客户端自行测试。 |
+| `2. 云优选` | 获取第三方已测量的候选，按运营商和 IPv4/IPv6 分类，筛选延迟较低的入口。 |
+
+**云优选使用的是数据源测得的延迟，不是你手机、电脑到节点的实测延迟。** 生成后仍需在实际使用的网络上测试，不保证每个候选都比原节点快。
+
+## 会生成多少节点
+
+云优选默认根据 VPS 能使用的网络选择范围：
+
+| VPS 网络 | 每个运营商最多生成 |
+| --- | --- |
+| 只有 IPv4 | 5 个 IPv4 节点 |
+| 只有 IPv6 | 5 个 IPv6 节点 |
+| IPv4、IPv6 都有 | 3 个 IPv4 + 3 个 IPv6 节点 |
+
+这些是上限。例如某运营商只有 2 个有效候选，就只生成 2 个，不会用无效地址凑数。双栈结果先显示 IPv4，再显示 IPv6。
+
+只有 IPv4 时只获取 IPv4 列表；只有 IPv6 时只获取 IPv6 列表。云优选会先尝试主要接口，失败后自动尝试同一类地址的备用网页。
+
+## 常用操作
+
+| 想做什么 | 命令或操作 |
+| --- | --- |
+| 重新生成优选节点 | `cfy` |
+| 查看上一次结果 | `cfy -c` |
+| 更新 cfy 脚本 | `cfy --update` |
+| 从 sb 菜单进入 | `sb --cfy` |
+| 在手机或电脑上使用新结果 | 生成成功后，在客户端刷新原来的订阅。 |
+
+更新脚本不会自动重新生成节点。需要新结果时，再运行一次 `cfy`。
+
+### 只要 IPv4，或想减少数量
+
+通常直接运行 `cfy` 即可。需要改变本次生成方式时，可以使用下面任一命令，然后在菜单中选择“云优选”：
+
+```bash
+# 只生成 IPv4 候选
+CFY_IP_VERSION_SCOPE=ipv4 cfy
+
+# 只生成 IPv6 候选
+CFY_IP_VERSION_SCOPE=ipv6 cfy
+
+# 生成 IPv4 和 IPv6 候选
 CFY_IP_VERSION_SCOPE=both cfy
+
+# 每个运营商、每种地址最多生成 2 个
 CFY_PER_ISP_LIMIT=2 cfy
-CFY_NAME_PREFIX=HK-NAT cfy
+
+# 自定义本次生成的节点名前缀
+CFY_NAME_PREFIX=MyVPS cfy
+```
+
+这些设置只用于本次运行。IPv4/IPv6 选项控制的是生成的节点入口，不会给 VPS 开通新的地址，也不会改变 VPS 的系统网络设置。
+
+## 结果和原节点会怎样
+
+- **原节点保留。** 优选成功后，新节点与原节点合并到订阅中。
+- **生成失败时保留上一次成功结果。** 不会因为数据源暂时不可用就清空现有订阅。
+- **修改原节点后要重新优选。** 例如更换节点身份信息或 Argo 域名后，旧优选节点会退出公开订阅；重新成功运行 cfy，再刷新客户端订阅。
+- **cfy 不参与日常连接。** 它只在生成时工作，不会因为安装了 cfy 就多一层常驻转发服务。
+
+平时用 `cfy -c` 查看结果即可。需要手动找文件时：
+
+| 文件 | 内容 |
+| --- | --- |
+| `/etc/sing-box/cfy-url.txt` | 最近一次生成的优选节点链接。 |
+| `/etc/sing-box/all-url.txt` | 原节点与优选节点的合并链接。 |
+| `/etc/sing-box/cfy-results/` | 历史生成结果。 |
+
+## NAT VPS 和 IPv6
+
+cfy 不要求新增 VPS 入站端口；只要原来的 Argo 节点可用，就可以在此基础上尝试优选。
+
+- 只有内网 IPv4，但能正常通过 IPv4 上网的 NAT VPS，会按 IPv4 单栈处理。
+- 自动检查无法确认 IPv4 或 IPv6 可用时，会提示并尝试生成 IPv4 候选；如果 VPS 本身不能访问数据源，仍可能生成失败。
+- VPS 没有 IPv6，但最终使用节点的客户端有 IPv6 时，可以显式选择双栈候选，是否可连接以客户端测试为准。
+- 订阅端口没有公网映射时，订阅地址可能打不开；可以先用 `cfy -c` 复制节点链接，或通过 sb 配置 HTTPS 订阅。
+
+## 遇到问题怎么办
+
+| 现象 | 怎么处理 |
+| --- | --- |
+| 没找到可用的原节点 | 先确认 Sing-box-Pre 中有可用的 WS-TLS-Argo 节点；Reality 节点不能用作 cfy 的 Argo 模板。 |
+| 提示正在尝试备用网页 | 等待本轮完成，这是自动回退过程，不一定是生成失败。 |
+| 最后提示获取失败或没有有效 IP | 检查 VPS 能否访问外网，稍后重试；也可切换到“Cloudflare 官方”来源。旧结果仍可用 `cfy -c` 查看。 |
+| 生成数量比预期少 | 有效候选不足，或部分候选被过滤，脚本不会强行凑满。 |
+| 生成成功，但节点连不上 | 先测试原 Argo 节点；原节点正常时，再换一个优选入口并在客户端重新测试。 |
+| 换了 Argo 域名后，订阅里的优选节点消失 | 重新运行 cfy，生成与新域名匹配的节点，再刷新客户端订阅。 |
+| 更新后没有新节点 | `cfy --update` 只更新脚本，再运行 `cfy` 才会重新生成。 |
+
+<details>
+<summary>可选：在 VPS 上增加一次连接筛选</summary>
+
+```bash
 CFY_HEALTH_PROBE=1 cfy
 ```
 
-健康探测适合在与最终客户端网络条件相近的环境中主动启用。直接在 VPS 上启用可能因为路由差异产生假阴性，因此不作为默认行为。
+开启后，云优选会对 VLESS 候选额外做轻量连接检查。它不代表完整节点认证或实际客户端连接成功。
 
-## 依赖
+这个检查使用的是 VPS 的网络。VPS 访问失败的入口，你的客户端可能仍可用，因此默认关闭；没有明确需要时保持默认即可。
 
-需要 `bash`、`curl`、`jq`、`flock`、`sha256sum`、`stat`、`base64`、`mktemp`、`grep` 和 `sed`。Debian/Ubuntu 可安装：
+</details>
 
-```bash
-apt update && apt install -y curl jq coreutils util-linux grep sed
-```
+## 更新与卸载
 
-只有将 `SING_BOX_TRANSACTION_GROUP` 设置为组名而不是数字 GID 时，才额外需要 `getent`。
-
-## 开发验证
-
-仓库测试均使用临时目录和模拟命令，不写入真实 `/etc/sing-box`：
+已安装后更新：
 
 ```bash
-bash -n cfy.sh
-shellcheck -S error cfy.sh
-for test_file in tests/*.sh; do bash "$test_file"; done
+cfy --update
 ```
 
-测试覆盖候选质量与数量、无效 RTT、单双栈选择、VLESS/VMess 改写、订阅代际、权限、事务锁、回滚、安装更新和跨项目文件契约。
+也可以重新从远端获取更新：
 
-## 上游与鸣谢
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/Pretic/Pre-cfy/main/cfy.sh) --update
+```
 
-- 上游项目：[byJoey/cfy](https://github.com/byJoey/cfy)
-- 感谢 byJoey 及上游贡献者提供早期脚本基础。
+如果要移除 cfy 命令，执行：
+
+```bash
+sudo rm /usr/local/bin/cfy
+```
+
+这不会卸载 sing-box，也不会删除已有的节点或历史结果。
+
+## 项目来源
+
+本项目基于 [byJoey/cfy](https://github.com/byJoey/cfy) 持续维护，现由 Pretic 独立维护，不代表上游项目。感谢 byJoey 及上游贡献者提供早期脚本基础。
+
+配套项目：[Sing-box-Pre](https://github.com/Pretic/Sing-box-Pre)。
 
 ## 免责声明
 
 - 本脚本仅供学习和技术交流使用，请勿用于任何非法用途。
-- 第三方优选数据的时效性与准确性由数据源决定；脚本只做格式、RTT 和可选连通性筛选，不承诺每个候选始终可用。
+- 第三方优选数据的时效性与准确性由数据源决定；脚本只做格式、延迟和可选连通性筛选，不承诺每个候选始终可用。
 - 用户应遵守服务器所在地和使用所在地的法律法规，并自行承担使用风险。
