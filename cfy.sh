@@ -208,11 +208,13 @@ write_text_file() {
 
 show_help() {
     echo "用法: cfy [参数]"
-    echo "  无参数        生成 Cloudflare 优选节点"
+    echo "  无参数        读取本机节点；没有节点时可手动导入"
+    echo "  -m, --manual  手动导入其他来源的节点，结果独立保存"
+    echo "  -f, --file 文件  从节点文件导入，支持逐行链接或 Base64 订阅"
     echo "  -c, --check   查看最近一次生成的优选节点"
     echo "      --update  更新 cfy 脚本后退出"
     echo "  -h, --help    显示帮助"
-    echo "VLESS 默认逐个验证 TLS/WebSocket 握手；这不是客户端线路测速。"
+    echo "VLESS/VMess WS+TLS 可用于 Cloudflare CDN、Tunnel、Workers；默认验证握手。"
 }
 
 show_update_done() {
@@ -1049,6 +1051,9 @@ load_source_urls_locked() {
     [ "${SUBSCRIPTION_LOCK_HELD:-0}" = 1 ] || return 1
     urls=()
     load_urls_from_file "$URL_FILE" || true
+    if [ ${#urls[@]} -eq 0 ] && [ "${CFY_EXTERNAL_SOURCE:-0}" = 1 ]; then
+        load_urls_from_base64_file "$URL_FILE" || true
+    fi
     source_generation=$(get_subscription_source_generation "$URL_FILE") || return 1
     SOURCE_URL_GENERATION="$source_generation"
 }
@@ -1240,7 +1245,11 @@ save_generated_urls_locked() {
 
     echo -e "${GREEN}已保存最近一次优选结果: ${RESULT_FILE}${NC}"
     echo -e "${GREEN}已同步到综合订阅: ${SERVED_SUB_FILE}${NC}"
-    echo -e "${GREEN}后续可运行 cfy -c 再次查看。${NC}"
+    if [ "${CFY_EXTERNAL_SOURCE:-0}" = 1 ]; then
+        echo -e "${GREEN}外部节点结果独立保存，未修改 sb 订阅。${NC}"
+    else
+        echo -e "${GREEN}后续可运行 cfy -c 再次查看。${NC}"
+    fi
 }
 
 save_generated_urls() {
@@ -1638,7 +1647,7 @@ get_vless_ps() {
     local url="$1"
     local ps="${url##*#}"
     if [ "$ps" = "$url" ] || [ -z "$ps" ]; then
-        ps="vless-ws-tls-argo"
+        ps="vless-ws-tls"
     fi
     echo "$ps"
 }
@@ -1779,19 +1788,117 @@ get_vless_query_param() {
     return 1
 }
 
-is_vless_ws_tls_argo() {
-    local url="$1"
-    local security transport host sni
+valid_template_hostname() {
+    local value="$1"
+    [[ "$value" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] &&
+        [[ "$value" == *.* && "$value" != *..* ]] &&
+        ! is_valid_ipv4_literal "$value"
+}
 
-    [[ "$url" == vless://* ]] || return 1
-    security="$(get_vless_query_param "$url" "security")"
-    transport="$(get_vless_query_param "$url" "type")"
-    host="$(get_vless_query_param "$url" "host")"
-    sni="$(get_vless_query_param "$url" "sni")"
+normalize_vless_template() {
+    local url="$1" host sni server path flow core fragment
+    [[ "$url" == vless://*'@'*'?'* ]] || return 1
+    [ "$(get_vless_query_param "$url" security)" = tls ] || return 1
+    [ "$(get_vless_query_param "$url" type)" = ws ] || return 1
+    flow=$(get_vless_query_param "$url" flow || true)
+    [ -z "$flow" ] || return 1
+    host=$(get_vless_query_param "$url" host || true)
+    sni=$(get_vless_query_param "$url" sni || true)
+    server=${url#*@}; server=${server%%\?*}; server=${server%%:*}
+    if [ -z "$host" ]; then host=${sni:-$server}; fi
+    if [ -z "$sni" ]; then sni=$host; fi
+    valid_template_hostname "$host" && valid_template_hostname "$sni" || return 1
+    path=$(get_vless_query_param "$url" path || true)
+    [[ -z "$path" || "$path" == /* ]] || return 1
+    [[ "$path" != *$'\r'* && "$path" != *$'\n'* ]] || return 1
+    core=${url%%#*}; fragment=''
+    [[ "$url" != *'#'* ]] || fragment="#${url#*#}"
+    [ -n "$(get_vless_query_param "$url" host || true)" ] || core+="&host=$(url_encode_fragment "$host")"
+    [ -n "$(get_vless_query_param "$url" sni || true)" ] || core+="&sni=$(url_encode_fragment "$sni")"
+    printf '%s%s\n' "$core" "$fragment"
+}
 
-    [ "$security" = "tls" ] || return 1
-    [ "$transport" = "ws" ] || return 1
-    [ -n "$host" ] || [ -n "$sni" ]
+is_vless_ws_tls() {
+    normalize_vless_template "$1" >/dev/null 2>&1
+}
+
+decode_vmess_template() {
+    local data="${1#vmess://}" padding
+    [[ "$1" == vmess://* ]] || return 1
+    data=${data//-/+}; data=${data//_/\/}
+    [[ "$data" =~ ^[A-Za-z0-9+/]+={0,2}$ ]] || return 1
+    padding=$(( (4 - ${#data} % 4) % 4 ))
+    while [ "$padding" -gt 0 ]; do data+='='; padding=$((padding-1)); done
+    printf '%s' "$data" | base64 -d 2>/dev/null
+}
+
+normalize_vmess_template() {
+    local json host sni
+    json=$(decode_vmess_template "$1") || return 1
+    json=$(printf '%s' "$json" | jq -ce '
+      select(type=="object" and .net=="ws" and .tls=="tls" and
+        (.id|type=="string" and length>0) and (.add|type=="string" and length>0)) |
+      .host = (if (.host // "") != "" then .host elif (.sni // "") != "" then .sni else .add end) |
+      .sni = (if (.sni // "") != "" then .sni else .host end) |
+      .path = (if (.path // "") != "" then .path else "/" end) |
+      .port = ((.port // "443")|tostring) |
+      select((.host|type=="string") and (.sni|type=="string") and
+        (.path|type=="string" and startswith("/") and (test("[\\r\\n]")|not)) and
+        (.port|test("^[0-9]{1,5}$")) and (.port|tonumber)>0 and (.port|tonumber)<=65535)
+    ') || return 1
+    host=$(printf '%s' "$json" | jq -r .host); sni=$(printf '%s' "$json" | jq -r .sni)
+    valid_template_hostname "$host" && valid_template_hostname "$sni" || return 1
+    printf '%s\n' "$json"
+}
+
+read_manual_template() {
+    local value normalized json
+    while true; do
+        read -r -s -p '粘贴 VLESS/VMess WS+TLS 链接（不回显）: ' value || return 1
+        printf '\n' >&2
+        if [[ "$value" == vless://* ]] && normalized=$(normalize_vless_template "$value"); then
+            MANUAL_TEMPLATE=$normalized; return 0
+        elif [[ "$value" == vmess://* ]] && json=$(normalize_vmess_template "$value"); then
+            MANUAL_TEMPLATE="vmess://$(printf '%s' "$json" | base64 | tr -d '\n')"; return 0
+        fi
+        echo '链接无效或不是 WS+TLS；请使用已接入 Cloudflare 的 VLESS/VMess 节点。' >&2
+    done
+}
+
+configure_external_workspace() {
+    local mode="$1" input="${2:-}" root="${CFY_EXTERNAL_ROOT:-/var/lib/pre-cfy}" key
+    [[ "$root" == /* && "$root" != / && "$root" != *$'\n'* && "$root" != *$'\r'* ]] || return 1
+    case "/${root#/}/" in *'//'*|*/../*|*/./*) return 1 ;; esac
+    validate_transaction_path_components "$root" || return 1
+    if [ -e "$root" ]; then
+        validate_transaction_directory "$root" 700 "$(id -g)" || return 1
+    else
+        ensure_transaction_directory "$root" 700 "$(id -g)" || return 1
+    fi
+    # Independent outputs never replace the sb subscription or source files.
+    if [ "$mode" = file ]; then
+        [ -f "$input" ] && [ ! -L "$input" ] && [ -r "$input" ] || { echo '节点文件不存在、不可读或是符号链接。' >&2; return 1; }
+        input=$(readlink -f -- "$input") || return 1
+        key=$(printf '%s' "$input" | sha256sum) || return 1
+        root="$root/file-${key:0:16}"
+    elif [ "$mode" = manual ]; then
+        root="$root/manual"
+    else return 1; fi
+    ensure_transaction_directory "$root" 700 "$(id -g)" || return 1
+    RESULT_FILE="$root/cfy-url.txt"; SUB_FILE="$root/cfy-sub.txt"
+    COMBINED_URL_FILE="$root/all-url.txt"; COMBINED_SUB_FILE="$root/all-sub.txt"
+    SERVED_SUB_FILE="$root/sub.txt"; RESULT_DIR="$root/history"
+    SUBSCRIPTION_LOCK_FILE="$root/.subscription.lock"
+    CFY_SOURCE_GENERATION_FILE="$root/cfy-source.generation"
+    SING_BOX_TRANSACTION_ROOT="$root/transactions"
+    CFY_EXTERNAL_SOURCE=1
+    if [ "$mode" = manual ]; then
+        URL_FILE="$root/source.txt"
+        [ ! -L "$URL_FILE" ] || return 1
+        if [ ! -f "$URL_FILE" ] || [ "$(cat "$URL_FILE")" != "$input" ]; then
+            with_subscription_lock write_text_file "$URL_FILE" "$input" || return 1
+        fi
+    else URL_FILE="$input"; fi
 }
 
 show_source_templates() {
@@ -1799,11 +1906,11 @@ show_source_templates() {
 
     load_source_urls || return 1
     [ ${#urls[@]} -gt 0 ] || return 1
-    echo -e "${GREEN}=== Sing-box 已创建的 VLESS-WS-TLS-Argo 模板节点 ===${NC}"
+    echo -e "${GREEN}=== 已有 VLESS-WS-TLS 模板节点 ===${NC}"
 
     for line in "${urls[@]}"; do
         [ -z "$line" ] && continue
-        if is_vless_ws_tls_argo "$line"; then
+        if is_vless_ws_tls "$line"; then
             echo "$line"
             found=1
         fi
@@ -1978,9 +2085,10 @@ update_vmess_url() {
     local original_json="$1"
     local new_add="$2"
     local new_ps="$3"
-    local modified_json new_base64
-
-    modified_json=$(echo "$original_json" | jq --arg new_add "$new_add" --arg new_ps "$new_ps" '.add = $new_add | .ps = $new_ps | del(.allowInsecure)')
+    local modified_json new_base64 port
+    port=$(printf '%s' "$original_json" | jq -r '.port // "443"') || return 1
+    normalize_edge_input "$new_add" "$port"
+    modified_json=$(echo "$original_json" | jq --arg new_add "$EDGE_HOST" --arg new_port "$EDGE_PORT" --arg new_ps "$new_ps" '.add = $new_add | .port = $new_port | .ps = $new_ps | del(.allowInsecure)') || return 1
     new_base64=$(echo -n "$modified_json" | base64 | tr -d '\n')
     echo "vmess://${new_base64}"
 }
@@ -2016,32 +2124,31 @@ cidr_to_usable_ip() {
 }
 
 select_vless_template() {
-    local url ps
-
+    local url normalized ps
     for url in "${urls[@]}"; do
-        is_vless_ws_tls_argo "$url" || continue
-        ps=$(get_vless_ps "$url")
-        valid_urls+=("$url")
-        valid_ps_names+=("$ps")
-        valid_types+=("vless")
+        normalized=$(normalize_vless_template "$url") || continue
+        ps=$(get_vless_ps "$normalized")
+        valid_urls+=("$normalized"); valid_ps_names+=("$ps"); valid_types+=("vless")
     done
 }
 
 select_vmess_template() {
-    local url decoded_json ps
-
+    local url json normalized ps
     for url in "${urls[@]}"; do
-        [[ "$url" == vmess://* ]] || continue
-        decoded_json=$(echo "${url#"vmess://"}" | base64 -d 2>/dev/null)
-        if [ $? -eq 0 ] && [ -n "$decoded_json" ]; then
-            ps=$(echo "$decoded_json" | jq -r .ps 2>/dev/null)
-            if [ $? -eq 0 ] && [ -n "$ps" ] && [ "$ps" != "null" ]; then
-                valid_urls+=("$url")
-                valid_ps_names+=("$ps")
-                valid_types+=("vmess")
-            fi
-        fi
+        json=$(normalize_vmess_template "$url") || continue
+        ps=$(printf '%s' "$json" | jq -r '.ps // "vmess-ws-tls"')
+        normalized="vmess://$(printf '%s' "$json" | base64 | tr -d '\n')"
+        valid_urls+=("$normalized"); valid_ps_names+=("$ps"); valid_types+=("vmess")
     done
+}
+
+probe_vmess_edge_candidate() {
+    local json="$1" edge="$2" template host sni path port
+    host=$(printf '%s' "$json" | jq -r .host); sni=$(printf '%s' "$json" | jq -r .sni)
+    path=$(printf '%s' "$json" | jq -r .path); port=$(printf '%s' "$json" | jq -r .port)
+    # WebSocket upgrade is independent of the proxy protocol's authentication.
+    template="vless://probe@${sni}:${port}?security=tls&type=ws&host=$(url_encode_fragment "$host")&sni=$(url_encode_fragment "$sni")&path=$(url_encode_fragment "$path")"
+    probe_vless_edge_candidate "$template" "$edge"
 }
 
 finalize_generated_urls() {
@@ -2060,12 +2167,12 @@ finalize_generated_urls() {
 
 main() {
     local url_file="$URL_FILE"
-    declare -a valid_urls valid_ps_names valid_types
+    local -a valid_urls=() valid_ps_names=() valid_types=()
     generated_urls=()
 
     echo -e "${GREEN}=================================================="
     echo -e " 节点优选生成器 (cfy)"
-    echo -e " (适配老王的4合一sing-box)"
+    echo -e " (支持 Cloudflare CDN / Tunnel / Workers 节点)"
     echo -e " "
     echo -e " 作者: byJoey (github.com/byJoey)"
     echo -e " 博客: joeyblog.net"
@@ -2073,6 +2180,12 @@ main() {
     echo -e "==================================================${NC}"
     echo ""
 
+    if [ -n "${CFY_TEMPLATE_FILE:-}" ]; then
+        configure_external_workspace file "$CFY_TEMPLATE_FILE" || return 1
+    elif [ "${CFY_FORCE_MANUAL:-0}" = 1 ] || [ ! -f "$URL_FILE" ]; then
+        read_manual_template || return 1
+        configure_external_workspace manual "$MANUAL_TEMPLATE" || return 1
+    fi
     load_source_urls
     local load_status=$?
     if [ "$load_status" -ne 0 ]; then
@@ -2081,9 +2194,7 @@ main() {
     fi
     if [ ${#urls[@]} -gt 0 ]; then
         select_vless_template
-        if [ ${#valid_urls[@]} -eq 0 ]; then
-            select_vmess_template
-        fi
+        select_vmess_template
     fi
 
     local selected_url selected_type
@@ -2106,25 +2217,12 @@ main() {
             done
         fi
     else
-        echo -e "${YELLOW}在 Sing-box 节点来源中未找到可用于优选的 VLESS-WS-TLS 或 VMess 模板.${NC}"
-        show_template_sources_hint
-        while true; do
-            read -p "请手动粘贴一个 vless:// 或 vmess:// 链接作为模板: " selected_url || return 1
-            if [[ "$selected_url" == vless://* ]]; then
-                selected_type="vless"
-                break
-            fi
-            if [[ "$selected_url" == vmess://* ]]; then
-                decoded_json=$(echo "${selected_url#"vmess://"}" | base64 -d 2>/dev/null)
-                if [ $? -ne 0 ] || [ -z "$decoded_json" ]; then echo -e "${RED}无法解码链接, 请检查链接是否完整有效.${NC}"; continue; fi
-                ps_check=$(echo "$decoded_json" | jq -e .ps >/dev/null 2>&1)
-                if [ $? -ne 0 ]; then echo -e "${RED}解码成功, 但JSON内容不完整或格式错误. 请重试.${NC}"; continue; fi
-                selected_type="vmess"
-                break
-            fi
-            echo -e "${RED}格式错误, 必须以 vless:// 或 vmess:// 开头.${NC}"
-            continue
-        done
+        echo -e "${YELLOW}没有兼容节点，请粘贴其他来源的 WS+TLS 链接。${NC}"
+        read_manual_template || return 1
+        configure_external_workspace manual "$MANUAL_TEMPLATE" || return 1
+        load_source_urls || return 1
+        selected_url=$MANUAL_TEMPLATE
+        case "$selected_url" in vless://*) selected_type=vless ;; vmess://*) selected_type=vmess ;; esac
     fi
 
     local base64_part original_json original_ps
@@ -2196,6 +2294,10 @@ main() {
                 fi
                 generated_url=$(update_vless_url "$selected_url" "$current_ip" "$new_ps")
             else
+                if [ "$CFY_HEALTH_PROBE" != "0" ] && ! probe_vmess_edge_candidate "$original_json" "$current_ip"; then
+                    echo -e "${YELLOW}跳过未通过握手验证的候选。${NC}" >&2
+                    continue
+                fi
                 generated_url=$(update_vmess_url "$original_json" "$current_ip" "$new_ps")
             fi
             echo "$generated_url"
@@ -2222,6 +2324,10 @@ main() {
                 fi
                 generated_url=$(update_vless_url "$selected_url" "$ip_from_range" "$new_ps")
             else
+                if [ "$CFY_HEALTH_PROBE" != "0" ] && ! probe_vmess_edge_candidate "$original_json" "$ip_from_range"; then
+                    echo -e "${YELLOW}跳过未通过握手验证的候选。${NC}" >&2
+                    continue
+                fi
                 generated_url=$(update_vmess_url "$original_json" "$ip_from_range" "$new_ps")
             fi
             echo "$generated_url"
@@ -2236,7 +2342,15 @@ main() {
     finalize_generated_urls "$num_to_generate" || return $?
 }
 
-case "$1" in
+case "${1:-}" in
+    -m|--manual)
+        [ "$#" -eq 1 ] || { show_help; exit 1; }
+        CFY_FORCE_MANUAL=1
+        ;;
+    -f|--file)
+        [ "$#" -eq 2 ] && [ -n "$2" ] || { show_help; exit 1; }
+        CFY_TEMPLATE_FILE=$2
+        ;;
     -c|--check|--show)
         show_saved_results
         exit $?
@@ -2249,6 +2363,8 @@ case "$1" in
         update_self
         exit $?
         ;;
+    "") ;;
+    *) show_help; exit 1 ;;
 esac
 
 check_deps
