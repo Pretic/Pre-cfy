@@ -127,7 +127,7 @@ index e6d76c0..e7c445d 100755
          ;;
  esac
  
- diff --git a/tests/test_update_atomic_validation.sh b/tests/test_update_atomic_validation.sh
+diff --git a/tests/test_update_atomic_validation.sh b/tests/test_update_atomic_validation.sh
 new file mode 100644
 index 0000000..39f03f2
 --- /dev/null
