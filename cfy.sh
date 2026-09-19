@@ -220,46 +220,75 @@ show_update_done() {
 }
 
 update_self() {
-    if [ "$(id -u)" -ne 0 ]; then
-        echo -e "${RED}错误: 更新需要管理员权限，请使用 root 或 sudo 运行。${NC}"
-        exit 1
-    fi
-
-    check_update_dependencies || exit 1
-
-    if ! command -v curl >/dev/null 2>&1; then
-        echo -e "${RED}错误: 未找到 curl，无法从远端更新 cfy。${NC}"
-        exit 1
-    fi
-
-    local tmp_file
-    tmp_file="$(mktemp)"
-    echo -e "${YELLOW}正在从 GitHub 下载最新 cfy 脚本...${NC}"
-
-    if ! curl -fsSL "$REMOTE_URL" -o "$tmp_file"; then
-        rm -f "$tmp_file"
-        echo -e "${RED}下载失败: 无法访问 $REMOTE_URL${NC}"
-        echo -e "${YELLOW}请先检查本机是否能访问 raw.githubusercontent.com。${NC}"
-        exit 1
-    fi
-
-    if ! grep -q 'INSTALL_PATH="/usr/local/bin/cfy"' "$tmp_file"; then
-        rm -f "$tmp_file"
-        echo -e "${RED}下载内容校验失败，未覆盖本地 cfy。${NC}"
-        exit 1
-    fi
-
-    if ! install -m 755 "$tmp_file" "$INSTALL_PATH"; then
-        rm -f "$tmp_file"
-        echo -e "${RED}写入 $INSTALL_PATH 失败。${NC}"
-        exit 1
-    fi
-
-    rm -f "$tmp_file"
-    if ! repair_served_subscription_file; then
-        echo -e "${YELLOW}警告: 无法修复 $SERVED_SUB_FILE 的读取权限，请手动执行 chmod 644。${NC}"
-    fi
-    show_update_done
+    # The subshell owns the update lock and always removes staging files.
+    (
+        if [ "$(id -u)" -ne 0 ]; then
+            echo -e "${RED}错误: 更新需要 root 权限。${NC}" >&2
+            exit 1
+        fi
+        check_update_dependencies || exit 1
+        command -v curl >/dev/null 2>&1 || {
+            echo -e "${RED}错误: 未找到 curl。${NC}" >&2; exit 1;
+        }
+        [[ "$REMOTE_URL" == https://* && "$REMOTE_URL" != *$'\n'* ]] || {
+            echo -e "${RED}更新地址必须使用 HTTPS。${NC}" >&2; exit 1;
+        }
+        local target_dir lock_file lock_fd tmp_file='' stage_file='' backup_stage=''
+        local expected_sha="${CFY_UPDATE_SHA256:-}" actual_sha
+        target_dir=$(dirname -- "$INSTALL_PATH") || exit 1
+        [ -d "$target_dir" ] && [ ! -L "$target_dir" ] && [ -w "$target_dir" ] || exit 1
+        [[ "$INSTALL_PATH" == /* ]] && [ ! -L "$INSTALL_PATH" ] && \
+            { [ ! -e "$INSTALL_PATH" ] || [ -f "$INSTALL_PATH" ]; } || {
+                echo -e "${RED}更新目标不是安全的普通文件，未覆盖。${NC}" >&2; exit 1;
+            }
+        if [ -n "$expected_sha" ] && [[ ! "$expected_sha" =~ ^[0-9A-Fa-f]{64}$ ]]; then
+            echo -e "${RED}CFY_UPDATE_SHA256 必须为 64 位十六进制校验值。${NC}" >&2; exit 1
+        fi
+        lock_file="${target_dir}/.cfy-update.lock"
+        [ ! -L "$lock_file" ] && { [ ! -e "$lock_file" ] || { [ -f "$lock_file" ] && [ -O "$lock_file" ]; }; } || exit 1
+        exec {lock_fd}>>"$lock_file" || exit 1
+        chmod 600 "$lock_file" || exit 1
+        flock -w 15 "$lock_fd" || {
+            echo -e "${YELLOW}另一个 cfy 更新正在进行，未修改本地文件。${NC}" >&2; exit 1;
+        }
+        trap 'rm -f -- "$tmp_file" "$stage_file" "$backup_stage"' EXIT
+        trap 'exit 130' INT
+        trap 'exit 143' TERM HUP
+        tmp_file=$(mktemp "${target_dir}/.cfy-download.XXXXXX") || exit 1
+        echo -e "${YELLOW}正在从 GitHub 下载 cfy 脚本...${NC}"
+        if ! curl -fsSL --proto '=https' --proto-redir '=https' \
+            --connect-timeout 10 --max-time 45 --retry 2 --retry-max-time 60 \
+            "$REMOTE_URL" -o "$tmp_file"; then
+            echo -e "${RED}下载失败，原 cfy 保持不变。${NC}" >&2; exit 1
+        fi
+        if [ ! -s "$tmp_file" ] || ! bash -n "$tmp_file" 2>/dev/null || \
+            ! grep -q 'INSTALL_PATH="/usr/local/bin/cfy"' "$tmp_file"; then
+            echo -e "${RED}下载内容或 Bash 语法校验失败，未覆盖本地 cfy。${NC}" >&2; exit 1
+        fi
+        if [ -n "$expected_sha" ]; then
+            actual_sha=$(sha256sum -- "$tmp_file") || exit 1
+            actual_sha=${actual_sha%%[[:space:]]*}
+            [ "${actual_sha,,}" = "${expected_sha,,}" ] || {
+                echo -e "${RED}SHA256 不匹配，未覆盖本地 cfy。${NC}" >&2; exit 1;
+            }
+        fi
+        stage_file=$(mktemp "${target_dir}/.cfy-install.XXXXXX") || exit 1
+        install -m 755 "$tmp_file" "$stage_file" && bash -n "$stage_file" || exit 1
+        # Recheck after download. Never follow a replacement symlink/directory.
+        [ ! -L "$INSTALL_PATH" ] && { [ ! -e "$INSTALL_PATH" ] || [ -f "$INSTALL_PATH" ]; } || exit 1
+        if [ -f "$INSTALL_PATH" ]; then
+            backup_stage=$(mktemp "${target_dir}/.cfy-backup.XXXXXX") || exit 1
+            cp -p -- "$INSTALL_PATH" "$backup_stage" && \
+                mv -Tf -- "$backup_stage" "${target_dir}/.cfy-previous" || exit 1
+        fi
+        mv -Tf -- "$stage_file" "$INSTALL_PATH" || {
+            echo -e "${RED}原子替换失败，原 cfy 保持不变。${NC}" >&2; exit 1;
+        }
+        if ! repair_served_subscription_file; then
+            echo -e "${YELLOW}cfy 已更新，但订阅读取权限修复失败。${NC}" >&2
+        fi
+        show_update_done
+    )
 }
 
 show_saved_results() {
@@ -2208,7 +2237,7 @@ case "$1" in
         ;;
     --update|--upgrade)
         update_self
-        exit 0
+        exit $?
         ;;
 esac
 
