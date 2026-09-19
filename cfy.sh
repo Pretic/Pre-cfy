@@ -31,7 +31,7 @@ CFY_OPTIMIZED_IP_API_URL="${CFY_OPTIMIZED_IP_API_URL:-https://www.wetest.vip/api
 CFY_OPTIMIZED_IP_API_KEY="${CFY_OPTIMIZED_IP_API_KEY:-o1zrmHAF}"
 CFY_IP_VERSION_SCOPE="${CFY_IP_VERSION_SCOPE:-}"
 CFY_PER_ISP_LIMIT="${CFY_PER_ISP_LIMIT:-}"
-CFY_HEALTH_PROBE="${CFY_HEALTH_PROBE:-0}"
+CFY_HEALTH_PROBE="${CFY_HEALTH_PROBE:-1}"
 CFY_HEALTH_PROBE_ATTEMPTS="${CFY_HEALTH_PROBE_ATTEMPTS:-2}"
 CFY_HEALTH_MIN_SUCCESS="${CFY_HEALTH_MIN_SUCCESS:-2}"
 CFY_HEALTH_CONNECT_TIMEOUT="${CFY_HEALTH_CONNECT_TIMEOUT:-3}"
@@ -101,13 +101,13 @@ install_from_remote() {
     tmp_file="$(mktemp)"
     echo "正在从 GitHub 下载最新 cfy 脚本..."
 
-    if ! curl -fsSL "$REMOTE_URL" -o "$tmp_file"; then
+    if ! curl -q -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 60 "$REMOTE_URL" -o "$tmp_file"; then
         rm -f "$tmp_file"
         echo "下载失败: 无法访问 $REMOTE_URL"
         return 1
     fi
 
-    if ! grep -q 'REMOTE_URL="https://raw.githubusercontent.com/Pretic/Pre-cfy/main/cfy.sh"' "$tmp_file"; then
+    if ! bash -n "$tmp_file" || ! grep -q 'REMOTE_URL="https://raw.githubusercontent.com/Pretic/Pre-cfy/main/cfy.sh"' "$tmp_file"; then
         rm -f "$tmp_file"
         echo "下载内容校验失败，未覆盖本地 cfy。"
         return 1
@@ -212,6 +212,7 @@ show_help() {
     echo "  -c, --check   查看最近一次生成的优选节点"
     echo "      --update  更新 cfy 脚本后退出"
     echo "  -h, --help    显示帮助"
+    echo "VLESS 默认逐个验证 TLS/WebSocket 握手；这不是客户端线路测速。"
 }
 
 show_update_done() {
@@ -2096,7 +2097,7 @@ main() {
             for i in "${!valid_ps_names[@]}"; do printf "%3d) %s\n" "$((i+1))" "${valid_ps_names[$i]}"; done
             local choice
             while true; do
-                read -p "请输入选项编号 (1-${#valid_urls[@]}): " choice
+                read -p "请输入选项编号 (1-${#valid_urls[@]}): " choice || return 1
                 if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#valid_urls[@]} ]; then
                     selected_url=${valid_urls[$((choice-1))]}
                     selected_type=${valid_types[$((choice-1))]}
@@ -2108,7 +2109,7 @@ main() {
         echo -e "${YELLOW}在 Sing-box 节点来源中未找到可用于优选的 VLESS-WS-TLS 或 VMess 模板.${NC}"
         show_template_sources_hint
         while true; do
-            read -p "请手动粘贴一个 vless:// 或 vmess:// 链接作为模板: " selected_url
+            read -p "请手动粘贴一个 vless:// 或 vmess:// 链接作为模板: " selected_url || return 1
             if [[ "$selected_url" == vless://* ]]; then
                 selected_type="vless"
                 break
@@ -2137,12 +2138,12 @@ main() {
     echo -e "${GREEN}已选择: $original_ps${NC}"
 
     echo -e "${YELLOW}请选择要使用的 IP 地址来源:${NC}"
-    echo "  1) Cloudflare 官方 (手动优选)"
+    echo "  1) Cloudflare 官方网段候选（非测速优选）"
     echo "  2) 云优选  "
 
     local ip_source_choice; local use_optimized_ips=false; local IP_VERSION_SCOPE="ipv4"
     while true; do
-        read -p "请输入选项编号 (1-2): " ip_source_choice
+        read -p "请输入选项编号 (1-2): " ip_source_choice || return 1
         if [[ "$ip_source_choice" == "1" ]]; then break;
         elif [[ "$ip_source_choice" == "2" ]]; then use_optimized_ips=true; break;
         else echo -e "${RED}无效的输入, 请重试.${NC}"; fi
@@ -2160,8 +2161,8 @@ main() {
         mapfile -t ip_list <<< "$cloudflare_ips"
         echo -e "${GREEN}成功获取 ${#ip_list[@]} 个 Cloudflare IPv4 地址段.${NC}"
         while true; do
-            read -p "请输入您想生成的 URL 数量: " num_to_generate
-            if [[ "$num_to_generate" =~ ^[0-9]+$ ]] && [ "$num_to_generate" -gt 0 ]; then break;
+            read -p "请输入候选检查数量 (1-30): " num_to_generate || return 1
+            if [[ "$num_to_generate" =~ ^[0-9]{1,2}$ ]] && [ "$num_to_generate" -gt 0 ] && [ "$num_to_generate" -le 30 ]; then break;
             else echo -e "${RED}请输入一个有效的正整数.${NC}"; fi
         done
     fi
@@ -2215,6 +2216,10 @@ main() {
             local new_ps="${name_prefix}-CF$((i+1))"
             local generated_url
             if [ "$selected_type" = "vless" ]; then
+                if [ "$CFY_HEALTH_PROBE" != "0" ] && ! probe_vless_edge_candidate "$selected_url" "$ip_from_range"; then
+                    echo -e "${YELLOW}跳过未通过握手验证的官方网段候选。${NC}" >&2
+                    continue
+                fi
                 generated_url=$(update_vless_url "$selected_url" "$ip_from_range" "$new_ps")
             else
                 generated_url=$(update_vmess_url "$original_json" "$ip_from_range" "$new_ps")
@@ -2222,6 +2227,11 @@ main() {
             echo "$generated_url"
             generated_urls+=("$generated_url")
         done
+    fi
+    num_to_generate=${#generated_urls[@]}
+    if [ "$num_to_generate" -eq 0 ]; then
+        echo -e "${RED}没有通过检查的节点，保留原订阅。${NC}" >&2
+        return 1
     fi
     finalize_generated_urls "$num_to_generate" || return $?
 }
