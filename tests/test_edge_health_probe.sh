@@ -22,6 +22,8 @@ source <(extract_function extract_vless_port)
 source <(extract_function normalize_edge_input)
 source <(extract_function is_ipv6_edge)
 source <(extract_function validate_websocket_probe_headers)
+source <(extract_function websocket_probe_complete_status)
+source <(extract_function probe_vless_edge_attempts)
 source <(printf '%s\n' "${probe_source}")
 
 tmp_root=$(mktemp -d)
@@ -82,7 +84,7 @@ curl() {
     accept=$(printf '%s' "${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11" | openssl dgst -sha1 -binary | openssl base64 -A)
     [ "$fixture" != wrong_accept ] || accept='incorrect'
     if [ "$fixture" != empty ]; then
-        printf 'HTTP/1.1 200 Connection established\r\n\r\nHTTP/1.1 101 Switching Protocols\r\n' > "$headers"
+        printf 'HTTP/1.1 200 Connection established\r\n\r\nHTTP/1.1 %s Status\r\n' "${http_code:-101}" > "$headers"
         [ "$fixture" = missing_upgrade ] || printf 'uPgRaDe: WebSocket\r\n' >> "$headers"
         [ "$fixture" = missing_connection ] || printf 'Connection: keep-alive, Upgrade\r\n' >> "$headers"
         printf 'Sec-WebSocket-Accept: %s\r\n' "$accept" >> "$headers"
@@ -105,6 +107,12 @@ done
 http_code=101
 curl_rc=60
 if probe_vless_edge_candidate "$template" '104.17.0.1'; then fail 'accepted a TLS verification failure'; fi
+curl_rc=56
+probe_vless_edge_candidate "$template" '104.17.0.1' || fail 'complete valid 101 followed by reset was rejected'
+CFY_HEALTH_MIN_SUCCESS=1
+before=$(wc -l < "$tmp_root/nonces")
+probe_vless_edge_candidate "$template" '104.17.0.1'
+[[ $(wc -l < "$tmp_root/nonces") -eq $((before+1)) ]] || fail 'success caused an unnecessary second request'
 curl_rc=0
 expected_resolve='tunnel.example.com:443:[2606:4700::1]'
 probe_vless_edge_candidate "$template" '[2606:4700::1]' || fail 'IPv6 formatting fixture failed'

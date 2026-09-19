@@ -5,7 +5,9 @@ d=$(mktemp -d); trap 'rm -rf "$d"' EXIT
 unset CFY_HEALTH_PROBE
 source <(grep '^CFY_HEALTH_PROBE=' "$script")
 [[ "$CFY_HEALTH_PROBE" == 1 ]]
-source <(sed -n '/^main() {/,/^}/p' "$script")
+for f in main screen_edge_candidates screen_edge_candidates_impl cfy_probe_reason; do
+ source <(sed -n "/^${f}() {/,/^}/p" "$script")
+done
 URL_FILE="$d/input"; touch "$URL_FILE"; GREEN=''; RED=''; YELLOW=''; NC=''
 CFY_CURL_CONNECT_TIMEOUT=1; CFY_CURL_MAX_TIME=1
 load_source_urls() { urls=('vless://fixture'); }
@@ -17,7 +19,7 @@ cidr_to_usable_ip() { echo 104.16.0.1; }
 probe_vless_edge_candidate() { return "${PROBE_RC:-0}"; }
 update_vless_url() { echo "vless://fixture#$3"; }
 finalize_generated_urls() { echo "$1" > "$d/published"; }
-printf '1\n3\n' > "$d/choices"
+printf '1\n1\n3\n' > "$d/choices"
 (main < "$d/choices") > "$d/log" 2>&1
 [[ "$(cat "$d/published")" == 3 ]]
 rm "$d/published"

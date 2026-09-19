@@ -33,7 +33,8 @@ CFY_IP_VERSION_SCOPE="${CFY_IP_VERSION_SCOPE:-}"
 CFY_PER_ISP_LIMIT="${CFY_PER_ISP_LIMIT:-}"
 CFY_HEALTH_PROBE="${CFY_HEALTH_PROBE:-1}"
 CFY_HEALTH_PROBE_ATTEMPTS="${CFY_HEALTH_PROBE_ATTEMPTS:-2}"
-CFY_HEALTH_MIN_SUCCESS="${CFY_HEALTH_MIN_SUCCESS:-2}"
+CFY_HEALTH_MIN_SUCCESS="${CFY_HEALTH_MIN_SUCCESS:-1}"
+CFY_HEALTH_CONCURRENCY="${CFY_HEALTH_CONCURRENCY:-3}"
 CFY_HEALTH_CONNECT_TIMEOUT="${CFY_HEALTH_CONNECT_TIMEOUT:-3}"
 CFY_HEALTH_MAX_TIME="${CFY_HEALTH_MAX_TIME:-5}"
 
@@ -1558,7 +1559,7 @@ get_all_optimized_ips() {
         ipv4|ipv6|both) ;;
         *) echo -e "${RED}Invalid IP scope: ${IP_VERSION_SCOPE}.${NC}"; return 1 ;;
     esac
-    echo -e "${YELLOW}Fetching optimized IP list (scope ${IP_VERSION_SCOPE})...${NC}"
+    echo -e "${YELLOW}正在获取优选入口（${IP_VERSION_SCOPE}）...${NC}"
 
     local paired_data_file
     paired_data_file=$(mktemp) || return 1
@@ -1570,7 +1571,7 @@ get_all_optimized_ips() {
         local isp_label=$'\347\272\277\350\267\257\345\220\215\347\247\260'
         local latency_label=$'\345\276\200\350\277\224\345\273\266\350\277\237'
 
-        echo -e "  -> Fetching ${type_desc} list..."
+        echo -e "  -> 正在获取 ${type_desc} 列表..."
         html_content=$(curl -fsSL --connect-timeout "$CFY_CURL_CONNECT_TIMEOUT" --max-time "$CFY_CURL_MAX_TIME" "$url" 2>/dev/null || true)
         if [ -z "$html_content" ]; then
             echo -e "${RED}  -> Failed to fetch ${type_desc} list.${NC}"
@@ -1593,7 +1594,7 @@ get_all_optimized_ips() {
     fetch_family() {
         local api_type="$1" expected_version="$2" html_url="$3" type_desc="$4" api_content
 
-        echo -e "  -> Fetching ${type_desc} list..."
+        echo -e "  -> 正在获取 ${type_desc} 列表..."
         api_content=$(curl -fsSL \
             --connect-timeout "$CFY_CURL_CONNECT_TIMEOUT" \
             --max-time "$CFY_CURL_MAX_TIME" \
@@ -1640,7 +1641,7 @@ get_all_optimized_ips() {
         echo -e "${RED}Parsed sources but found no valid IP addresses.${NC}"
         return 1
     fi
-    echo -e "${GREEN}Selected ${#ip_list[@]} low-RTT optimized IP addresses (${count_ipv4} IPv4, ${count_ipv6} IPv6; up to ${group_limit} per ISP/family; scope ${IP_VERSION_SCOPE}).${NC}"
+    echo -e "${GREEN}取得 ${#ip_list[@]} 个候选（IPv4 ${count_ipv4} 个，IPv6 ${count_ipv6} 个）。${NC}"
     return 0
 }
 get_vless_ps() {
@@ -1752,7 +1753,7 @@ choose_ip_version_scope() {
     if [ "$has_ipv4" = "0" ] && [ "$has_ipv6" = "0" ]; then
         echo -e "${YELLOW}Could not verify either IP stack; falling back to IPv4 candidates.${NC}"
     else
-        echo -e "${GREEN}Detected VPS IP stack: ${IP_VERSION_SCOPE}.${NC}"
+        echo -e "${GREEN}检测到 VPS 地址族： ${IP_VERSION_SCOPE}.${NC}"
     fi
 }
 
@@ -1995,66 +1996,206 @@ validate_websocket_probe_headers() {
     ' "$header_file"
 }
 
+websocket_probe_complete_status() {
+    # Ignore interim responses; a complete header block is the decision boundary.
+    awk '
+      { sub(/\r$/, "") }
+      /^HTTP\/[0-9.]+[ \t]+[0-9]+/ {
+        code=$2; tunnel=(tolower($0) ~ /connection established/); next
+      }
+      /^$/ {
+        if (code && !tunnel && (code==101 || code>=200)) { print code; exit }
+        code=0
+      }
+    ' "$1"
+}
+
+cfy_probe_reason() {
+    case "$1" in
+        ok) printf '握手通过' ;;
+        timeout) printf '本机检查超时' ;;
+        tls) printf 'TLS 验证失败' ;;
+        connect) printf '本机无法连接' ;;
+        dns) printf '域名解析失败' ;;
+        invalid-upgrade) printf 'WebSocket 响应无效' ;;
+        http-*) printf 'HTTP %s' "${1#http-}" ;;
+        *) printf '本机检查未通过' ;;
+    esac
+}
+
 probe_vless_edge_candidate() {
-    local original_url="$1"
-    local edge_address="$2"
-    local host sni path port tls_host request_host resolve_address status
-    local header_file ws_key expected_accept curl_status
-    local attempts="${CFY_HEALTH_PROBE_ATTEMPTS:-2}"
-    local minimum_success="${CFY_HEALTH_MIN_SUCCESS:-2}"
-    local success_count=0 attempt
+    # A dedicated child owns its curl and staging files. Propagate cancellation
+    # explicitly; killing an outer Bash alone does not stop its grandchildren.
+    local probe_pid probe_rc=0 saved_signals
+    saved_signals=$(trap -p INT TERM HUP)
+    probe_vless_edge_attempts "$@" &
+    probe_pid=$!
+    trap 'kill "$probe_pid" 2>/dev/null || :; wait "$probe_pid" 2>/dev/null || :; exit 130' INT
+    trap 'kill "$probe_pid" 2>/dev/null || :; wait "$probe_pid" 2>/dev/null || :; exit 143' TERM HUP
+    wait "$probe_pid" || probe_rc=$?
+    trap - INT TERM HUP
+    [ -z "$saved_signals" ] || eval "$saved_signals"
+    return "$probe_rc"
+}
 
-    [[ "$attempts" =~ ^[1-9][0-9]*$ ]] || attempts=2
-    [[ "$minimum_success" =~ ^[1-9][0-9]*$ ]] || minimum_success=$attempts
-    [ "$minimum_success" -le "$attempts" ] || minimum_success=$attempts
+probe_vless_edge_attempts() {
+        local original_url="$1" edge_address="$2" host sni path port tls_host request_host
+        local resolve_address status header_file ws_key expected_accept curl_status pid='' stage=''
+        local attempts="${CFY_HEALTH_PROBE_ATTEMPTS:-2}" minimum="${CFY_HEALTH_MIN_SUCCESS:-1}"
+        local max_time="${CFY_HEALTH_MAX_TIME:-5}" connect_time="${CFY_HEALTH_CONNECT_TIMEOUT:-3}"
+        local success_count=0 attempt reason=network stopped
+        [[ "$attempts" =~ ^[1-4]$ ]] || attempts=2
+        [[ "$minimum" =~ ^[1-4]$ ]] || minimum=1
+        [ "$minimum" -le "$attempts" ] || minimum=$attempts
+        [[ "$max_time" =~ ^([1-9]|1[0-5])$ ]] || max_time=5
+        [[ "$connect_time" =~ ^([1-9]|1[0-5])$ ]] || connect_time=3
+        [ "$connect_time" -le "$max_time" ] || connect_time=$max_time
+        trap '[ -z "$pid" ] || { kill "$pid" 2>/dev/null || :; wait "$pid" 2>/dev/null || :; }; [ -z "$stage" ] || rm -rf -- "$stage"' EXIT
+        trap 'exit 130' INT
+        trap 'exit 143' TERM HUP
+        umask 077
+        stage=$(mktemp -d) || exit 1
+        header_file="$stage/headers"
+        host=$(get_vless_query_param "$original_url" host || true)
+        sni=$(get_vless_query_param "$original_url" sni || true)
+        path=$(get_vless_query_param "$original_url" path || true)
+        port=$(extract_vless_port "$original_url")
+        tls_host="${sni:-$host}"; request_host="${host:-$tls_host}"
+        [ -n "$tls_host" ] && [ -n "$request_host" ] || exit 1
+        [ -n "$path" ] || path=/
+        normalize_edge_input "$edge_address" "$port"
+        resolve_address="$EDGE_HOST"
+        if is_ipv6_edge "$EDGE_HOST"; then resolve_address="[$EDGE_HOST]"; fi
+        for ((attempt=1; attempt<=attempts; attempt++)); do
+            ws_key=$(openssl rand -base64 16 2>/dev/null) || exit 1
+            [[ "$ws_key" =~ ^[A-Za-z0-9+/]{22}==$ ]] || exit 1
+            expected_accept=$(set -o pipefail
+                printf '%s' "${ws_key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11" |
+                    openssl dgst -sha1 -binary | openssl base64 -A
+            ) || exit 1
+            : > "$header_file"
+            # curl otherwise waits for the upgraded connection to close, even
+            # though its complete 101 response is already enough for this test.
+            curl -q --noproxy '*' --retry 0 --proto '=https' --http1.1 --globoff --path-as-is \
+                --silent --output /dev/null --dump-header "$header_file" \
+                --connect-timeout "$connect_time" --max-time "$max_time" \
+                --resolve "${tls_host}:${EDGE_PORT}:${resolve_address}" \
+                --header "Host: ${request_host}" --header 'Connection: Upgrade' \
+                --header 'Upgrade: websocket' --header 'Sec-WebSocket-Version: 13' \
+                --header "Sec-WebSocket-Key: ${ws_key}" \
+                "https://${tls_host}:${EDGE_PORT}${path}" > "$stage/meta" 2> "$stage/error" &
+            pid=$!; status=''; stopped=0
+            while kill -0 "$pid" 2>/dev/null; do
+                status=$(websocket_probe_complete_status "$header_file")
+                if [ -n "$status" ]; then
+                    # Only stop our own curl, never a service or other worker.
+                    if kill "$pid" 2>/dev/null; then stopped=1; fi
+                    break
+                fi
+                sleep 0.1
+            done
+            curl_status=0
+            wait "$pid" || curl_status=$?
+            pid=''
+            [ -n "$status" ] || status=$(websocket_probe_complete_status "$header_file")
+            reason=network
+            # A later close/reset must not negate a fully verified handshake.
+            # TLS errors still fail closed; -k/--insecure is never used.
+            if [ "$curl_status" -eq 60 ] || [ "$curl_status" -eq 51 ] || [ "$curl_status" -eq 35 ]; then
+                reason=tls
+            elif [ "$status" = 101 ] && validate_websocket_probe_headers "$header_file" "$expected_accept" && \
+                 { [ "$stopped" = 1 ] || [[ "$curl_status" =~ ^(0|18|23|28|52|56)$ ]]; }; then
+                success_count=$((success_count + 1)); reason=ok
+            elif [ "$status" = 101 ]; then reason=invalid-upgrade
+            elif [[ "$status" =~ ^[2-5][0-9][0-9]$ ]]; then reason="http-$status"
+            else
+                case "$curl_status" in 28) reason=timeout ;; 6) reason=dns ;; 7) reason=connect ;; esac
+            fi
+            if [ "$success_count" -ge "$minimum" ]; then
+                [ -z "${CFY_PROBE_RESULT_FILE:-}" ] || printf 'ok\n' > "$CFY_PROBE_RESULT_FILE"
+                exit 0
+            fi
+            # Retry transient failures only, and stop as soon as success is known.
+            case "$reason" in ok|timeout|connect|network) ;; *) break ;; esac
+            [ $((success_count + attempts - attempt)) -ge "$minimum" ] || break
+        done
+        [ -z "${CFY_PROBE_RESULT_FILE:-}" ] || printf '%s\n' "$reason" > "$CFY_PROBE_RESULT_FILE"
+        exit 1
+}
 
-    host=$(get_vless_query_param "$original_url" "host" || true)
-    sni=$(get_vless_query_param "$original_url" "sni" || true)
-    path=$(get_vless_query_param "$original_url" "path" || true)
-    port=$(extract_vless_port "$original_url")
-    tls_host="${sni:-$host}"
-    request_host="${host:-$tls_host}"
-    [ -n "$tls_host" ] && [ -n "$request_host" ] || return 1
-    [ -n "$path" ] || path="/"
+screen_edge_candidates_impl() {
+        local kind="$1" template="$2" json='' dir='' pid start index end reason
+        local concurrency="${CFY_HEALTH_CONCURRENCY:-3}" total=${#ip_list[@]}
+        local -a pids=()
+        [[ "$concurrency" =~ ^[1-6]$ ]] || concurrency=3
+        umask 077
+        dir=$(mktemp -d) || exit 1
+        trap 'for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null || :; done; for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || :; done; rm -rf -- "$dir"' EXIT
+        trap 'exit 130' INT
+        trap 'exit 143' TERM HUP
+        if [ "$kind" = vmess ]; then json=$(decode_vmess_template "$template") || exit 1; fi
+        printf '正在检查 %s 个入口（最多 %s 个并行）...\n' "$total" "$concurrency" >&2
+        for ((start=0; start<total; start+=concurrency)); do
+            end=$((start + concurrency)); [ "$end" -le "$total" ] || end=$total
+            pids=()
+            for ((index=start; index<end; index++)); do
+                (
+                    local worker_pid='' worker_rc=0
+                    trap '[ -z "$worker_pid" ] || { kill "$worker_pid" 2>/dev/null || :; wait "$worker_pid" 2>/dev/null || :; }' EXIT
+                    trap 'exit 130' INT
+                    trap 'exit 143' TERM HUP
+                    CFY_PROBE_RESULT_FILE="$dir/$index.reason"
+                    if [ "$kind" = vless ]; then
+                        probe_vless_edge_candidate "$template" "${ip_list[$index]}" &
+                    else probe_vmess_edge_candidate "$json" "${ip_list[$index]}" & fi
+                    worker_pid=$!
+                    wait "$worker_pid" || worker_rc=$?
+                    worker_pid=''
+                    if [ "$worker_rc" = 0 ]; then
+                        : > "$dir/$index.ok"; reason=ok
+                    else
+                        reason=network
+                        [ ! -s "$CFY_PROBE_RESULT_FILE" ] || read -r reason < "$CFY_PROBE_RESULT_FILE"
+                    fi
+                    printf '[%s/%s] %s：%s\n' "$((index+1))" "$total" "${ip_list[$index]}" "$(cfy_probe_reason "$reason")" >&2
+                ) &
+                pids+=("$!")
+            done
+            for pid in "${pids[@]}"; do wait "$pid" || exit 1; done
+            pids=()
+        done
+        for ((index=0; index<total; index++)); do
+            if [ -f "$dir/$index.ok" ]; then printf '%s\n' "$index"; fi
+        done
+}
 
-    normalize_edge_input "$edge_address" "$port"
-    resolve_address="$EDGE_HOST"
-    if is_ipv6_edge "$EDGE_HOST"; then
-        resolve_address="[$EDGE_HOST]"
+screen_edge_candidates() {
+    [ "${CFY_HEALTH_PROBE:-1}" != 0 ] || {
+        printf '本次未检查握手，生成结果需在客户端验证。\n' >&2; return 0;
+    }
+    local indices index total=${#ip_list[@]} index_file screen_pid screen_rc=0 old_signals
+    local -a kept_ips=() kept_isps=()
+    index_file=$(mktemp) || return 1
+    old_signals=$(trap -p INT TERM HUP)
+    screen_edge_candidates_impl "$@" > "$index_file" &
+    screen_pid=$!
+    trap 'kill "$screen_pid" 2>/dev/null || :; wait "$screen_pid" 2>/dev/null || :; rm -f -- "$index_file"; exit 130' INT
+    trap 'kill "$screen_pid" 2>/dev/null || :; wait "$screen_pid" 2>/dev/null || :; rm -f -- "$index_file"; exit 143' TERM HUP
+    wait "$screen_pid" || screen_rc=$?
+    trap - INT TERM HUP
+    [ -z "$old_signals" ] || eval "$old_signals"
+    indices=$(cat "$index_file"); rm -f -- "$index_file"
+    [ "$screen_rc" = 0 ] || return "$screen_rc"
+    while IFS= read -r index; do
+        [[ "$index" =~ ^[0-9]+$ ]] || continue
+        kept_ips+=("${ip_list[$index]}"); kept_isps+=("${isp_list[$index]:-}")
+    done <<< "$indices"
+    ip_list=("${kept_ips[@]}"); isp_list=("${kept_isps[@]}")
+    printf '检查完成：%s/%s 个入口握手通过。\n' "${#ip_list[@]}" "$total" >&2
+    if [ ${#ip_list[@]} -eq 0 ]; then
+        printf '本机未找到通过检查的入口，原订阅保持不变。请检查原节点或更换节点模板。\n' >&2
+        return 1
     fi
-
-    header_file=$(mktemp) || return 1
-    for ((attempt=1; attempt<=attempts; attempt++)); do
-        ws_key=$(openssl rand -base64 16 2>/dev/null) || { rm -f "$header_file"; return 1; }
-        [[ "$ws_key" =~ ^[A-Za-z0-9+/]{22}==$ ]] || { rm -f "$header_file"; return 1; }
-        expected_accept=$(set -o pipefail
-            printf '%s' "${ws_key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11" |
-                openssl dgst -sha1 -binary | openssl base64 -A
-        ) || { rm -f "$header_file"; return 1; }
-        : > "$header_file"
-        curl_status=0
-        status=$(curl -q --noproxy '*' --retry 0 --proto '=https' --http1.1 --silent --output /dev/null \
-            --dump-header "$header_file" \
-            --connect-timeout "${CFY_HEALTH_CONNECT_TIMEOUT:-3}" \
-            --max-time "${CFY_HEALTH_MAX_TIME:-5}" \
-            --resolve "${tls_host}:${EDGE_PORT}:${resolve_address}" \
-            --header "Host: ${request_host}" \
-            --header 'Connection: Upgrade' \
-            --header 'Upgrade: websocket' \
-            --header 'Sec-WebSocket-Version: 13' \
-            --header "Sec-WebSocket-Key: ${ws_key}" \
-            --write-out '%{http_code}' \
-            "https://${tls_host}:${EDGE_PORT}${path}" 2>/dev/null) || curl_status=$?
-        # A successful upgrade leaves the socket open. A time limit reached
-        # after complete, validated 101 headers is expected, not a failed handshake.
-        if { [ "$curl_status" -eq 0 ] || [ "$curl_status" -eq 28 ]; } &&
-           [ "$status" = 101 ] && validate_websocket_probe_headers "$header_file" "$expected_accept"; then
-            success_count=$((success_count + 1))
-        fi
-    done
-    rm -f "$header_file"
-
-    [ "$success_count" -ge "$minimum_success" ]
 }
 
 update_vless_url() {
@@ -2166,7 +2307,7 @@ finalize_generated_urls() {
 }
 
 main() {
-    local url_file="$URL_FILE"
+    local selected_from_manual=0 manual_ready=0 i
     local -a valid_urls=() valid_ps_names=() valid_types=()
     generated_urls=()
 
@@ -2185,6 +2326,7 @@ main() {
     elif [ "${CFY_FORCE_MANUAL:-0}" = 1 ] || [ ! -f "$URL_FILE" ]; then
         read_manual_template || return 1
         configure_external_workspace manual "$MANUAL_TEMPLATE" || return 1
+        selected_from_manual=1; manual_ready=1
     fi
     load_source_urls
     local load_status=$?
@@ -2197,29 +2339,31 @@ main() {
         select_vmess_template
     fi
 
-    local selected_url selected_type
-    if [ ${#valid_urls[@]} -gt 0 ]; then
-        if [ ${#valid_urls[@]} -eq 1 ]; then
-            selected_url=${valid_urls[0]}
-            selected_type=${valid_types[0]}
-            echo -e "${YELLOW}检测到只有一个有效节点, 已自动选择: ${valid_ps_names[0]}${NC}"
-        else
-            echo -e "${YELLOW}请选择一个节点作为:${NC}"
-            for i in "${!valid_ps_names[@]}"; do printf "%3d) %s\n" "$((i+1))" "${valid_ps_names[$i]}"; done
-            local choice
-            while true; do
-                read -p "请输入选项编号 (1-${#valid_urls[@]}): " choice || return 1
-                if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#valid_urls[@]} ]; then
-                    selected_url=${valid_urls[$((choice-1))]}
-                    selected_type=${valid_types[$((choice-1))]}
-                    break
-                else echo -e "${RED}无效的输入, 请重试.${NC}"; fi
-            done
+    local selected_url selected_type choice
+    if [ ${#valid_urls[@]} -gt 0 ] && [ "$selected_from_manual" = 0 ]; then
+        echo '请选择节点（回车使用第 1 项）：'
+        echo '  0) 手动粘贴其他节点链接'
+        for i in "${!valid_ps_names[@]}"; do printf '%3d) %s\n' "$((i+1))" "${valid_ps_names[$i]}"; done
+        while true; do
+            read -r -p "请输入编号 [0-${#valid_urls[@]}，默认 1]: " choice || return 1
+            choice=${choice:-1}
+            if [ "$choice" = 0 ]; then selected_from_manual=1; break; fi
+            if [[ "$choice" =~ ^[1-9][0-9]{0,5}$ ]] && [ "$choice" -le ${#valid_urls[@]} ]; then
+                selected_url=${valid_urls[$((choice-1))]}
+                selected_type=${valid_types[$((choice-1))]}
+                break
+            fi
+            echo '编号无效，请重新输入。' >&2
+        done
+    elif [ "$selected_from_manual" = 0 ]; then
+        selected_from_manual=1
+    fi
+    if [ "$selected_from_manual" = 1 ]; then
+        # --manual and the missing-file path have already obtained the link.
+        if [ "$manual_ready" = 0 ]; then
+            read_manual_template || return 1
+            configure_external_workspace manual "$MANUAL_TEMPLATE" || return 1
         fi
-    else
-        echo -e "${YELLOW}没有兼容节点，请粘贴其他来源的 WS+TLS 链接。${NC}"
-        read_manual_template || return 1
-        configure_external_workspace manual "$MANUAL_TEMPLATE" || return 1
         load_source_urls || return 1
         selected_url=$MANUAL_TEMPLATE
         case "$selected_url" in vless://*) selected_type=vless ;; vmess://*) selected_type=vmess ;; esac
@@ -2265,75 +2409,42 @@ main() {
         done
     fi
 
-    echo "---"; echo -e "${YELLOW}生成的新节点链接如下:${NC}"
-    if $use_optimized_ips; then
-        local name_prefix="${CFY_NAME_PREFIX:-$(get_name_prefix "$original_ps")}"
-        declare -A name_counts
-
-        for ((i=0; i<${#ip_list[@]}; i++)); do
-            local current_ip=${ip_list[$i]}; local isp_name=${isp_list[$i]}
-            local isp_group ip_version name_key new_ps generated_url
-
+    # Prepare once, then check a bounded batch instead of blocking per URL.
+    if ! $use_optimized_ips; then
+        local -a ranges=("${ip_list[@]}") candidates=()
+        local range candidate
+        for ((i=0; i<num_to_generate; i++)); do
+            range=${ranges[$((RANDOM % ${#ranges[@]}))]}
+            candidate=$(cidr_to_usable_ip "$range") || return 1
+            candidates+=("$candidate")
+        done
+        ip_list=("${candidates[@]}"); isp_list=()
+    fi
+    screen_edge_candidates "$selected_type" "$selected_url" || return 1
+    echo '---'; echo '生成的新节点链接如下：'
+    local current_ip isp_group ip_version name_key new_ps generated_url name_prefix
+    local -A name_counts=()
+    name_prefix="${CFY_NAME_PREFIX:-$original_ps}"
+    if $use_optimized_ips; then name_prefix="${CFY_NAME_PREFIX:-$(get_name_prefix "$original_ps")}"; fi
+    for ((i=0; i<${#ip_list[@]}; i++)); do
+        current_ip=${ip_list[$i]}
+        if $use_optimized_ips; then
             ip_version=$(get_edge_ip_version "$current_ip")
-            if ! should_include_ip_version "$ip_version"; then
-                continue
-            fi
-
-            isp_group=$(normalize_isp_group "$isp_name" || true)
+            should_include_ip_version "$ip_version" || continue
+            isp_group=$(normalize_isp_group "${isp_list[$i]:-}" || true)
             name_key="${isp_group:-generic}-${ip_version}"
             name_counts[$name_key]=$(( ${name_counts[$name_key]:-0} + 1 ))
-            if [ -n "$isp_group" ]; then
-                local new_ps="${name_prefix}-${isp_group}-${ip_version}-${name_counts[$name_key]}"
-            else
-                local new_ps="${name_prefix}-${ip_version}-${name_counts[$name_key]}"
-            fi
-            if [ "$selected_type" = "vless" ]; then
-                if [ "$CFY_HEALTH_PROBE" != "0" ] && ! probe_vless_edge_candidate "$selected_url" "$current_ip"; then
-                    echo -e "${YELLOW}Skipping unhealthy edge candidate: ${current_ip}${NC}" >&2
-                    continue
-                fi
-                generated_url=$(update_vless_url "$selected_url" "$current_ip" "$new_ps")
-            else
-                if [ "$CFY_HEALTH_PROBE" != "0" ] && ! probe_vmess_edge_candidate "$original_json" "$current_ip"; then
-                    echo -e "${YELLOW}跳过未通过握手验证的候选。${NC}" >&2
-                    continue
-                fi
-                generated_url=$(update_vmess_url "$original_json" "$current_ip" "$new_ps")
-            fi
-            echo "$generated_url"
-            generated_urls+=("$generated_url")
-            num_to_generate=$((num_to_generate + 1))
-        done
-
-        if [ "$num_to_generate" -eq 0 ]; then
-            echo -e "${RED}未找到符合 IPv4/IPv6 条件的优选入口.${NC}"
-            exit 1
+            new_ps="${name_prefix}-${isp_group:+${isp_group}-}${ip_version}-${name_counts[$name_key]}"
+        else new_ps="${name_prefix}-CF$((i+1))"; fi
+        if [ "$selected_type" = vless ]; then
+            generated_url=$(update_vless_url "$selected_url" "$current_ip" "$new_ps") || return 1
+        else
+            generated_url=$(update_vmess_url "$original_json" "$current_ip" "$new_ps") || return 1
         fi
-    else
-        for ((i=0; i<$num_to_generate; i++)); do
-            local random_ip_range=${ip_list[$((RANDOM % ${#ip_list[@]}))]}
-            local ip_from_range
-            ip_from_range=$(cidr_to_usable_ip "$random_ip_range")
-            local name_prefix="${CFY_NAME_PREFIX:-$original_ps}"
-            local new_ps="${name_prefix}-CF$((i+1))"
-            local generated_url
-            if [ "$selected_type" = "vless" ]; then
-                if [ "$CFY_HEALTH_PROBE" != "0" ] && ! probe_vless_edge_candidate "$selected_url" "$ip_from_range"; then
-                    echo -e "${YELLOW}跳过未通过握手验证的官方网段候选。${NC}" >&2
-                    continue
-                fi
-                generated_url=$(update_vless_url "$selected_url" "$ip_from_range" "$new_ps")
-            else
-                if [ "$CFY_HEALTH_PROBE" != "0" ] && ! probe_vmess_edge_candidate "$original_json" "$ip_from_range"; then
-                    echo -e "${YELLOW}跳过未通过握手验证的候选。${NC}" >&2
-                    continue
-                fi
-                generated_url=$(update_vmess_url "$original_json" "$ip_from_range" "$new_ps")
-            fi
-            echo "$generated_url"
-            generated_urls+=("$generated_url")
-        done
-    fi
+        [ -n "$generated_url" ] || return 1
+        printf '%s\n' "$generated_url"
+        generated_urls+=("$generated_url")
+    done
     num_to_generate=${#generated_urls[@]}
     if [ "$num_to_generate" -eq 0 ]; then
         echo -e "${RED}没有通过检查的节点，保留原订阅。${NC}" >&2
