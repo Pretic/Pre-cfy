@@ -5,7 +5,10 @@ d=$(mktemp -d); trap 'rm -rf "$d"' EXIT
 unset CFY_HEALTH_PROBE
 source <(grep '^CFY_HEALTH_PROBE=' "$script")
 [[ "$CFY_HEALTH_PROBE" == 1 ]]
-for f in main screen_edge_candidates screen_edge_candidates_impl cfy_probe_reason; do
+unset CFY_HEALTH_PROBE_ATTEMPTS CFY_HEALTH_MAX_TIME CFY_HEALTH_CONNECT_TIMEOUT
+source <(grep -E '^CFY_HEALTH_(PROBE_ATTEMPTS|MAX_TIME|CONNECT_TIMEOUT)=' "$script")
+[[ "$CFY_HEALTH_PROBE_ATTEMPTS" == 1 && "$CFY_HEALTH_MAX_TIME" == 3 && "$CFY_HEALTH_CONNECT_TIMEOUT" == 2 ]]
+for f in main screen_edge_candidates screen_edge_candidates_impl cfy_probe_reason read_cfy_cgroup_budget scan_cfy_cgroup_path get_cfy_memory_budget get_cfy_probe_concurrency; do
  source <(sed -n "/^${f}() {/,/^}/p" "$script")
 done
 URL_FILE="$d/input"; touch "$URL_FILE"; GREEN=''; RED=''; YELLOW=''; NC=''
@@ -21,7 +24,8 @@ update_vless_url() { echo "vless://fixture#$3"; }
 finalize_generated_urls() { echo "$1" > "$d/published"; }
 printf '1\n1\n3\n' > "$d/choices"
 (main < "$d/choices") > "$d/log" 2>&1
-[[ "$(cat "$d/published")" == 3 ]]
+# Repeated selections from one official range are checked and emitted once.
+[[ "$(cat "$d/published")" == 1 ]]
 rm "$d/published"
 PROBE_RC=1
 if (main < "$d/choices") > "$d/log" 2>&1; then exit 1; fi

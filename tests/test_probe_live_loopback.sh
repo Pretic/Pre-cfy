@@ -66,6 +66,26 @@ for _ in 1 2; do
 done
 end=$(date +%s%N); old_ms=$(( (end-start)/1000000 ))
 printf 'Local TLS/WebSocket hold-open comparison: old=%sms new=%sms\n' "$old_ms" "$new_ms"
+# Compare real all-timeout transports at old versus new defaults. Both must
+# reject every candidate and leave publication to the caller untouched.
+for profile in old fast; do
+ (
+  CFY_HEALTH_PROBE=1 CFY_HEALTH_CONCURRENCY=3
+  if [ "$profile" = old ]; then
+   CFY_HEALTH_PROBE_ATTEMPTS=2 CFY_HEALTH_MAX_TIME=5 CFY_HEALTH_CONNECT_TIMEOUT=3
+  else
+   unset CFY_HEALTH_PROBE_ATTEMPTS CFY_HEALTH_MAX_TIME CFY_HEALTH_CONNECT_TIMEOUT
+  fi
+  ip_list=(127.0.0.1 127.0.0.1 127.0.0.1); isp_list=(A B C)
+  begin=$(date +%s%N)
+  if screen_edge_candidates vless "${template}%2Fstall" 2> "$d/$profile.log"; then exit 1; fi
+  [[ ${#ip_list[@]} == 0 ]]
+  echo $(( ($(date +%s%N)-begin)/1000000 )) > "$d/$profile.ms"
+ )
+done
+old_fail_ms=$(cat "$d/old.ms"); fast_fail_ms=$(cat "$d/fast.ms")
+[[ "$fast_fail_ms" -lt $((old_fail_ms/2)) ]]
+printf 'Real loopback all-timeout (3 candidates): old defaults=%sms fast defaults=%sms; no candidates accepted.\n' "$old_fail_ms" "$fast_fail_ms"
 # Cancellation must stop only this run's curl workers and never publish results.
 sed -n '/^[A-Za-z_][A-Za-z_0-9]*() {/,/^}/p' "$repo/cfy.sh" > "$d/definitions"
 cat > "$d/cancel.sh" <<'SH'

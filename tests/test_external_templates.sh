@@ -13,6 +13,7 @@ normalized=$(normalize_vless_template "$v")
 [[ "$(get_vless_query_param "$normalized" sni)" == cdn.example.com ]]
 [[ "$(get_vless_query_param "$normalized" path)" == '/socket?ed=2048' ]]
 [[ "$(normalize_vless_template "$normalized")" == "$normalized" ]]
+[[ "$(normalize_vless_template "${v%#*}#two words")" == *'#two words' ]]
 for bad in "${v/security=tls/security=reality}" "${v/type=ws/type=tcp}" "${v/&path=/&flow=xtls-rprx-vision&path=}" 'vless://id@1.2.3.4:443?security=tls&type=ws'; do
  if normalize_vless_template "$bad" >/dev/null 2>&1; then echo 'accepted incompatible VLESS'; exit 1; fi
 done
@@ -50,6 +51,8 @@ save_generated_urls >/dev/null
 [[ "$(stat -c %a "$URL_FILE")" == 600 ]]
 manual_result=$RESULT_FILE; manual_digest=$(sha256sum "$RESULT_FILE")
 printf '%s\n%s\n' "$v" "$m" | base64 > "$d/import.txt"
+chmod 644 "$d/import.txt"
+printf 'unrelated-neighbor\n' > "$d/base-sub.txt"
 source_digest=$(sha256sum "$d/import.txt")
 configure_external_workspace file "$d/import.txt"
 load_source_urls
@@ -57,6 +60,14 @@ load_source_urls
 [[ "$RESULT_FILE" != "$manual_result" && "$RESULT_FILE" == "$d/external/"* ]]
 generated_urls=("$updated"); save_generated_urls >/dev/null
 [[ "$(sha256sum "$d/import.txt")" == "$source_digest" ]]
+[[ "$(stat -c %a "$d/import.txt")" == 644 ]]
+[[ "$(cat "$d/base-sub.txt")" == unrelated-neighbor ]]
+[[ "$BASE_SUB_FILE" == "$d/external/"* ]]
+[[ "$(base64 -d "$BASE_SUB_FILE")" == "$(printf '%s\n%s' "$v" "$m")" ]]
+[[ "$(base64 -d "$SERVED_SUB_FILE")" == "$(printf '%s\n%s\n%s' "$v" "$m" "$updated")" ]]
+for bad in 'vless://@cdn.example.com:443?security=tls&type=ws' 'vless://id@cdn.example.com:99999?security=tls&type=ws' 'vless://id@cdn.example.com:0?security=tls&type=ws' 'vless://id@cdn.example.com:abc?security=tls&type=ws'; do
+ if normalize_vless_template "$bad" >/dev/null 2>&1; then echo 'accepted malformed VLESS authority'; exit 1; fi
+done
 [[ "$(sha256sum "$manual_result")" == "$manual_digest" ]]
 # A concurrent source change still prevents stale publication in external mode.
 printf '%s\n' "$v" >> "$d/import.txt"

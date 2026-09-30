@@ -25,21 +25,24 @@ SERVED_SUB_FILE="${SERVED_SUB_FILE:-/etc/sing-box/sub.txt}"
 SUBSCRIPTION_LOCK_FILE="${SUBSCRIPTION_LOCK_FILE:-/etc/sing-box/.subscription.lock}"
 CFY_SOURCE_GENERATION_FILE="${CFY_SOURCE_GENERATION_FILE:-/etc/sing-box/cfy-source.generation}"
 RESULT_DIR="${RESULT_DIR:-/etc/sing-box/cfy-results}"
-CFY_CURL_CONNECT_TIMEOUT="${CFY_CURL_CONNECT_TIMEOUT:-10}"
-CFY_CURL_MAX_TIME="${CFY_CURL_MAX_TIME:-30}"
+CFY_CURL_CONNECT_TIMEOUT="${CFY_CURL_CONNECT_TIMEOUT:-3}"
+CFY_CURL_MAX_TIME="${CFY_CURL_MAX_TIME:-6}"
+CFY_SOURCE_MAX_TIME="${CFY_SOURCE_MAX_TIME:-16}"
 CFY_OPTIMIZED_IP_API_URL="${CFY_OPTIMIZED_IP_API_URL:-https://www.wetest.vip/api/cf2dns/get_cloudflare_ip}"
 CFY_OPTIMIZED_IP_API_KEY="${CFY_OPTIMIZED_IP_API_KEY:-o1zrmHAF}"
 CFY_IP_VERSION_SCOPE="${CFY_IP_VERSION_SCOPE:-}"
 CFY_PER_ISP_LIMIT="${CFY_PER_ISP_LIMIT:-}"
 CFY_HEALTH_PROBE="${CFY_HEALTH_PROBE:-1}"
-CFY_HEALTH_PROBE_ATTEMPTS="${CFY_HEALTH_PROBE_ATTEMPTS:-2}"
+CFY_HEALTH_PROBE_ATTEMPTS="${CFY_HEALTH_PROBE_ATTEMPTS:-1}"
 CFY_HEALTH_MIN_SUCCESS="${CFY_HEALTH_MIN_SUCCESS:-1}"
-CFY_HEALTH_CONCURRENCY="${CFY_HEALTH_CONCURRENCY:-3}"
-CFY_HEALTH_CONNECT_TIMEOUT="${CFY_HEALTH_CONNECT_TIMEOUT:-3}"
-CFY_HEALTH_MAX_TIME="${CFY_HEALTH_MAX_TIME:-5}"
+CFY_HEALTH_CONCURRENCY="${CFY_HEALTH_CONCURRENCY:-}"
+CFY_HEALTH_CONNECT_TIMEOUT="${CFY_HEALTH_CONNECT_TIMEOUT:-2}"
+CFY_HEALTH_MAX_TIME="${CFY_HEALTH_MAX_TIME:-3}"
 
 repair_served_subscription_file() {
+    [ ! -L "$SERVED_SUB_FILE" ] || return 1
     [ -e "$SERVED_SUB_FILE" ] || return 0
+    [ -f "$SERVED_SUB_FILE" ] || return 1
     chmod 644 "$SERVED_SUB_FILE"
 }
 
@@ -92,6 +95,33 @@ drain_bootstrap_input() {
     fi
 }
 
+install_validated_script() {
+    (
+        local source_file="$1" target_dir lock_file lock_fd stage='' backup=''
+        target_dir=$(dirname -- "$INSTALL_PATH") || exit 1
+        [ -s "$source_file" ] && bash -n "$source_file" || exit 1
+        [ -d "$target_dir" ] && [ ! -L "$target_dir" ] || exit 1
+        [[ "$INSTALL_PATH" == /* ]] && [ ! -L "$INSTALL_PATH" ] &&
+            { [ ! -e "$INSTALL_PATH" ] || [ -f "$INSTALL_PATH" ]; } || exit 1
+        lock_file="$target_dir/.cfy-update.lock"
+        [ ! -L "$lock_file" ] && { [ ! -e "$lock_file" ] || { [ -f "$lock_file" ] && [ -O "$lock_file" ]; }; } || exit 1
+        exec {lock_fd}>>"$lock_file" || exit 1
+        chmod 600 "$lock_file" && flock -w 15 "$lock_fd" || exit 1
+        trap 'rm -f -- "$stage" "$backup"' EXIT
+        trap 'exit 130' INT
+        trap 'exit 143' TERM HUP
+        stage=$(mktemp "$target_dir/.cfy-bootstrap.XXXXXX") || exit 1
+        install -m 755 -- "$source_file" "$stage" && bash -n "$stage" || exit 1
+        # Recheck after staging; never follow a replaced installed-file link.
+        [ ! -L "$INSTALL_PATH" ] && { [ ! -e "$INSTALL_PATH" ] || [ -f "$INSTALL_PATH" ]; } || exit 1
+        if [ -f "$INSTALL_PATH" ]; then
+            backup=$(mktemp "$target_dir/.cfy-backup.XXXXXX") || exit 1
+            cp -p -- "$INSTALL_PATH" "$backup" && mv -Tf -- "$backup" "$target_dir/.cfy-previous" || exit 1
+        fi
+        mv -Tf -- "$stage" "$INSTALL_PATH"
+    )
+}
+
 install_from_remote() {
     if ! command -v curl >/dev/null 2>&1; then
         echo "错误: 未找到 curl，无法从远端安装 cfy。"
@@ -114,7 +144,7 @@ install_from_remote() {
         return 1
     fi
 
-    if ! cp "$tmp_file" "$INSTALL_PATH"; then
+    if ! install_validated_script "$tmp_file"; then
         rm -f "$tmp_file"
         echo "❌ 写入脚本失败，请重试。"
         return 1
@@ -130,7 +160,7 @@ finish_install() {
     fi
 
     if ! repair_served_subscription_file; then
-        echo "警告: 无法修复 $SERVED_SUB_FILE 的读取权限，请手动执行 chmod 644。"
+        echo "警告: 无法修复 $SERVED_SUB_FILE 的读取权限，请检查它是否为普通文件及其权限。"
     fi
 
     echo "✅ 安装成功! 您现在可以随时随地运行 'cfy' 命令。"
@@ -162,7 +192,7 @@ if [ "$0" != "$INSTALL_PATH" ]; then
         drain_bootstrap_input || exit 1
         install_from_remote || exit 1
     else
-        if ! cp "$0" "$INSTALL_PATH"; then
+        if ! install_validated_script "$0"; then
             echo "❌ 复制脚本失败，请重试。"
             exit 1
         fi
@@ -215,6 +245,7 @@ show_help() {
     echo "  -c, --check   查看最近一次生成的优选节点"
     echo "      --update  更新 cfy 脚本后退出"
     echo "  -h, --help    显示帮助"
+    echo "  本地入口文件: CFY_EDGE_FILE=/路径/ips.txt cfy（跳过云数据源）"
     echo "VLESS/VMess WS+TLS 可用于 Cloudflare CDN、Tunnel、Workers；默认验证握手。"
 }
 
@@ -997,9 +1028,9 @@ normalize_url_candidate() {
     line="${line#"${line%%[![:space:]]*}"}"
     line="${line%"${line##*[![:space:]]}"}"
 
-    if [[ "$line" == vless://* || "$line" == vmess://* ]]; then
+    if [[ "$line" =~ ^[A-Za-z][A-Za-z0-9+.-]*:// ]]; then
         candidate="$line"
-    elif [[ "$line" =~ (vless://[^[:space:]]+|vmess://[^[:space:]]+) ]]; then
+    elif [[ "$line" =~ ((vless|vmess|trojan|hysteria2|hy2|tuic|ss|ssr|hysteria|socks|socks5)://[^[:space:]]+) ]]; then
         candidate="${BASH_REMATCH[1]}"
     else
         return 1
@@ -1012,10 +1043,17 @@ normalize_url_candidate() {
 }
 
 add_url_candidate() {
-    local line="$1" existing normalized
+    local line="$1" existing normalized found=0
 
     normalized=$(normalize_url_candidate "$line" || true)
     [ -n "$normalized" ] || return 0
+    # Preserve other imported node protocols in the base subscription; only
+    # VLESS/VMess are offered as templates for Cloudflare generation.
+    for existing in "${SOURCE_BASE_URLS[@]}"; do
+        if [ "$existing" = "$normalized" ]; then found=1; break; fi
+    done
+    [ "$found" = 1 ] || SOURCE_BASE_URLS+=("$normalized")
+    [[ "$normalized" == vless://* || "$normalized" == vmess://* ]] || return 0
     for existing in "${urls[@]}"; do
         [ "$existing" = "$normalized" ] && return 0
     done
@@ -1034,10 +1072,19 @@ load_urls_from_file() {
 }
 
 load_urls_from_base64_file() {
-    local source_file="$1" decoded line
+    local source_file="$1" encoded decoded line padding
 
     [ -s "$source_file" ] || return 1
-    decoded=$(base64 -d "$source_file" 2>/dev/null || base64 --decode "$source_file" 2>/dev/null || true)
+    encoded=$(tr -d '[:space:]' < "$source_file") || return 1
+    encoded=${encoded//-/+}; encoded=${encoded//_/\/}
+    [[ "$encoded" =~ ^[A-Za-z0-9+/]+={0,2}$ ]] || return 1
+    # Normalize optional padding, then decode exactly once. Never concatenate
+    # partial output from two failing decoder invocations.
+    encoded=${encoded%%=*}
+    [ $(( ${#encoded} % 4 )) -ne 1 ] || return 1
+    padding=$(( (4 - ${#encoded} % 4) % 4 ))
+    while [ "$padding" -gt 0 ]; do encoded+='='; padding=$((padding - 1)); done
+    decoded=$(printf '%s' "$encoded" | base64 -d 2>/dev/null) || return 1
     [ -n "$decoded" ] || return 1
     while IFS= read -r line || [ -n "$line" ]; do
         line="${line//$'\r'/}"
@@ -1050,30 +1097,26 @@ load_source_urls_locked() {
     local source_generation
 
     [ "${SUBSCRIPTION_LOCK_HELD:-0}" = 1 ] || return 1
-    urls=()
-    load_urls_from_file "$URL_FILE" || true
-    if [ ${#urls[@]} -eq 0 ] && [ "${CFY_EXTERNAL_SOURCE:-0}" = 1 ]; then
-        load_urls_from_base64_file "$URL_FILE" || true
-    fi
     source_generation=$(get_subscription_source_generation "$URL_FILE") || return 1
+    urls=(); SOURCE_BASE_URLS=()
+    load_urls_from_file "$URL_FILE" || true
+    if [ ${#SOURCE_BASE_URLS[@]} -eq 0 ] && [ "${CFY_EXTERNAL_SOURCE:-0}" = 1 ]; then
+        load_urls_from_base64_file "$URL_FILE" || {
+            echo '节点文件不是有效的逐行链接或 Base64 订阅，未修改结果。' >&2
+            return 1
+        }
+    fi
+    [ "$source_generation" = "$(get_subscription_source_generation "$URL_FILE")" ] || return 1
+    if [ "${CFY_EXTERNAL_SOURCE:-0}" = 1 ]; then
+        # Keep the caller's import read-only and publish decoded URI lines, not
+        # the original Base64 envelope. This snapshot shares the source lock.
+        write_text_file "$EXTERNAL_NORMALIZED_URL_FILE" "$(printf '%s\n' "${SOURCE_BASE_URLS[@]}")" || return 1
+    fi
     SOURCE_URL_GENERATION="$source_generation"
 }
 
 load_source_urls() {
     with_subscription_lock load_source_urls_locked
-}
-
-show_template_sources_hint() {
-    local source_file
-
-    echo -e "${YELLOW}已检查以下模板来源:${NC}"
-    for source_file in "$URL_FILE" "$COMBINED_URL_FILE" "$RESULT_FILE" "$SERVED_SUB_FILE"; do
-        if [ -s "$source_file" ]; then
-            echo "  - $source_file (存在)"
-        else
-            echo "  - $source_file (不存在或为空)"
-        fi
-    done
 }
 
 publish_subscriptions_locked() {
@@ -1082,8 +1125,9 @@ publish_subscriptions_locked() {
     local cfy_source_file=/dev/null
     local tmp_base_sub tmp_cfy_sub tmp_all_url tmp_all_sub tmp_sub tmp_sidecar='' target_file
     local base_sub_file="${BASE_SUB_FILE:-$(dirname "$URL_FILE")/base-sub.txt}"
-    local current_source_generation
-    local backup_file commit_failed=0 rollback_failed=0 index restore_index
+    local current_source_generation base_source_file="$URL_FILE"
+    local backup_file commit_failed=0 rollback_failed=0 index restore_index restore_start
+    local commit_interrupted=0 move_status saved_commit_signals
     local -a commit_sources=() commit_targets=() backup_files=() target_existed=()
 
     [ "${SUBSCRIPTION_LOCK_HELD:-0}" = 1 ] || return 1
@@ -1096,7 +1140,12 @@ publish_subscriptions_locked() {
     done
     mkdir -p "$(dirname "$RESULT_FILE")" "$(dirname "$CFY_SOURCE_GENERATION_FILE")" || return 1
     [ -f "$URL_FILE" ] || return 1
-    chmod 600 "$URL_FILE" || return 1
+    if [ "${CFY_EXTERNAL_SOURCE:-0}" = 1 ]; then
+        base_source_file="${EXTERNAL_NORMALIZED_URL_FILE:-}"
+        [ -f "$base_source_file" ] && [ ! -L "$base_source_file" ] || return 1
+    else
+        chmod 600 "$URL_FILE" || return 1
+    fi
     current_source_generation=$(get_subscription_source_generation "$URL_FILE") || return 1
 
     if [ -n "$staged_result_file" ]; then
@@ -1135,8 +1184,8 @@ publish_subscriptions_locked() {
     fi
 
     if ! awk '{ sub(/\r$/, ""); if ($0 ~ /^[[:space:]]*$/) next; if (!seen[$0]++) print }' \
-        "$URL_FILE" "$cfy_source_file" 2>/dev/null > "$tmp_all_url" ||
-       ! encode_subscription_source "$URL_FILE" "$tmp_base_sub" ||
+        "$base_source_file" "$cfy_source_file" 2>/dev/null > "$tmp_all_url" ||
+       ! encode_subscription_source "$base_source_file" "$tmp_base_sub" ||
        ! encode_subscription_source "$cfy_source_file" "$tmp_cfy_sub" ||
        ! encode_subscription_source "$tmp_all_url" "$tmp_all_sub" ||
        ! encode_subscription_source "$tmp_all_url" "$tmp_sub" ||
@@ -1182,10 +1231,18 @@ publish_subscriptions_locked() {
         backup_files+=("$backup_file")
     done
 
+    saved_commit_signals=$(trap -p INT TERM HUP)
+    trap 'commit_interrupted=130' INT
+    trap 'commit_interrupted=143' TERM HUP
     for ((index = 0; index < ${#commit_targets[@]}; index++)); do
-        if ! mv -f -- "${commit_sources[$index]}" "${commit_targets[$index]}"; then
+        move_status=0
+        mv -f -- "${commit_sources[$index]}" "${commit_targets[$index]}" || move_status=$?
+        if [ "$move_status" -ne 0 ] || [ "$commit_interrupted" -ne 0 ]; then
             commit_failed=1
-            for ((restore_index = index - 1; restore_index >= 0; restore_index--)); do
+            # Even a nonzero mv may have renamed before a signal arrived.
+            # Restoring the current target is safe whether or not it moved.
+            restore_start=$index
+            for ((restore_index = restore_start; restore_index >= 0; restore_index--)); do
                 if [ "${target_existed[$restore_index]}" = 1 ]; then
                     if ! mv -f -- "${backup_files[$restore_index]}" "${commit_targets[$restore_index]}"; then
                         rollback_failed=1
@@ -1203,6 +1260,8 @@ publish_subscriptions_locked() {
             break
         fi
     done
+    trap - INT TERM HUP
+    [ -z "$saved_commit_signals" ] || eval "$saved_commit_signals"
     rm -f "${commit_sources[@]}"
     if [ "$commit_failed" -eq 0 ]; then
         rm -f "${backup_files[@]}"
@@ -1213,6 +1272,7 @@ publish_subscriptions_locked() {
         return 2
     fi
     rm -f "${backup_files[@]}"
+    [ "$commit_interrupted" -eq 0 ] || return "$commit_interrupted"
     return 1
 }
 
@@ -1386,27 +1446,6 @@ check_deps() {
     fi
 }
 
-collect_unique_optimized_pairs() {
-    local source_file="$1"
-    local pair edge_ip edge_isp
-    declare -A seen_edges=()
-
-    ip_list=()
-    isp_list=()
-
-    while IFS= read -r pair || [ -n "$pair" ]; do
-        [ -n "$pair" ] || continue
-        edge_ip="${pair%% *}"
-        edge_isp="${pair#* }"
-        if [[ -n "${seen_edges[$edge_ip]+x}" ]]; then
-            continue
-        fi
-        seen_edges["$edge_ip"]=1
-        ip_list+=("$edge_ip")
-        isp_list+=("$edge_isp")
-    done < "$source_file"
-}
-
 collect_ranked_optimized_pairs() {
     local source_file="$1"
     local per_group_limit="${2:-3}"
@@ -1561,8 +1600,35 @@ get_all_optimized_ips() {
     esac
     echo -e "${YELLOW}正在获取优选入口（${IP_VERSION_SCOPE}）...${NC}"
 
-    local paired_data_file
+    local paired_data_file source_budget source_deadline request_share request_budget
+    source_budget="${CFY_SOURCE_MAX_TIME:-16}"
+    [[ "$source_budget" =~ ^[0-9]{1,3}$ ]] && [ "$source_budget" -ge 4 ] && [ "$source_budget" -le 120 ] || source_budget=16
+    source_budget=$((10#$source_budget))
+    source_deadline=$((SECONDS + source_budget))
+    # Reserve a fair attempt for each family and its fallback. A slow IPv4
+    # provider must not consume the entire IPv6 opportunity.
+    request_share=2; [ "$IP_VERSION_SCOPE" != both ] || request_share=4
+    request_budget=$((source_budget / request_share))
+    printf '云数据源总等待预算 %s 秒；超时可改用本地入口文件。\n' "$source_budget"
     paired_data_file=$(mktemp) || return 1
+
+    fetch_candidate_source() {
+        local remaining=$((source_deadline - SECONDS)) max_time="${CFY_CURL_MAX_TIME:-6}" connect_time="${CFY_CURL_CONNECT_TIMEOUT:-3}"
+        [ "$remaining" -gt 0 ] || return 28
+        [[ "$max_time" =~ ^[1-9][0-9]{0,2}$ ]] || max_time=6
+        [[ "$connect_time" =~ ^[1-9][0-9]{0,2}$ ]] || connect_time=3
+        [ "$max_time" -le "$request_budget" ] || max_time=$request_budget
+        [ "$max_time" -le "$remaining" ] || max_time=$remaining
+        [ "$connect_time" -le "$max_time" ] || connect_time=$max_time
+        local response response_status=0
+        response=$(set -o pipefail
+            curl -q -fsSL --retry 0 --max-filesize 1048576 --connect-timeout "$connect_time" --max-time "$max_time" "$@" |
+                head -c 1048577
+        ) || response_status=$?
+        [ "$response_status" -eq 0 ] || return "$response_status"
+        [ "$(LC_ALL=C printf '%s' "$response" | wc -c)" -le 1048576 ] || return 63
+        printf '%s' "$response"
+    }
 
     parse_html_url() {
         local url="$1" type_desc="$2" expected_version="$3"
@@ -1572,7 +1638,7 @@ get_all_optimized_ips() {
         local latency_label=$'\345\276\200\350\277\224\345\273\266\350\277\237'
 
         echo -e "  -> 正在获取 ${type_desc} 列表..."
-        html_content=$(curl -fsSL --connect-timeout "$CFY_CURL_CONNECT_TIMEOUT" --max-time "$CFY_CURL_MAX_TIME" "$url" 2>/dev/null || true)
+        html_content=$(fetch_candidate_source "$url" 2>/dev/null || true)
         if [ -z "$html_content" ]; then
             echo -e "${RED}  -> Failed to fetch ${type_desc} list.${NC}"
             return
@@ -1595,10 +1661,7 @@ get_all_optimized_ips() {
         local api_type="$1" expected_version="$2" html_url="$3" type_desc="$4" api_content
 
         echo -e "  -> 正在获取 ${type_desc} 列表..."
-        api_content=$(curl -fsSL \
-            --connect-timeout "$CFY_CURL_CONNECT_TIMEOUT" \
-            --max-time "$CFY_CURL_MAX_TIME" \
-            --get \
+        api_content=$(fetch_candidate_source --get \
             --data-urlencode "key=${api_key}" \
             --data-urlencode "type=${api_type}" \
             "$api_url" 2>/dev/null || true)
@@ -1650,7 +1713,7 @@ get_vless_ps() {
     if [ "$ps" = "$url" ] || [ -z "$ps" ]; then
         ps="vless-ws-tls"
     fi
-    echo "$ps"
+    url_decode "${ps//+/%2B}"
 }
 
 url_decode() {
@@ -1742,10 +1805,10 @@ choose_ip_version_scope() {
             ;;
     esac
 
-    if curl -4 -fsS --connect-timeout 4 --max-time 8 -o /dev/null https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null; then
+    if curl -4 -fsS --connect-timeout 2 --max-time 3 -o /dev/null https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null; then
         has_ipv4=1
     fi
-    if curl -6 -fsS --connect-timeout 4 --max-time 8 -o /dev/null https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null; then
+    if curl -6 -fsS --connect-timeout 2 --max-time 3 -o /dev/null https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null; then
         has_ipv6=1
     fi
 
@@ -1797,8 +1860,19 @@ valid_template_hostname() {
 }
 
 normalize_vless_template() {
-    local url="$1" host sni server path flow core fragment
+    local url="$1" host sni server path flow core fragment authority userinfo port
     [[ "$url" == vless://*'@'*'?'* ]] || return 1
+    core=${url%%#*}
+    [[ "$core" != *$'\r'* && "$core" != *$'\n'* && "$core" != *$'\t'* && "$core" != *' '* ]] || return 1
+    userinfo=${url#vless://}; userinfo=${userinfo%%@*}
+    [ -n "$userinfo" ] || return 1
+    authority=${url#*@}; authority=${authority%%\?*}
+    if [[ "$authority" == \[*\] ]]; then
+        : # An omitted port defaults to 443.
+    elif [[ "$authority" == *:* ]]; then
+        port=${authority##*:}
+        [[ "$port" =~ ^[0-9]{1,5}$ ]] && [ "$((10#$port))" -gt 0 ] && [ "$((10#$port))" -le 65535 ] || return 1
+    fi
     [ "$(get_vless_query_param "$url" security)" = tls ] || return 1
     [ "$(get_vless_query_param "$url" type)" = ws ] || return 1
     flow=$(get_vless_query_param "$url" flow || true)
@@ -1886,6 +1960,8 @@ configure_external_workspace() {
         root="$root/manual"
     else return 1; fi
     ensure_transaction_directory "$root" 700 "$(id -g)" || return 1
+    BASE_SUB_FILE="$root/base-sub.txt"
+    EXTERNAL_NORMALIZED_URL_FILE="$root/imported-url.txt"
     RESULT_FILE="$root/cfy-url.txt"; SUB_FILE="$root/cfy-sub.txt"
     COMBINED_URL_FILE="$root/all-url.txt"; COMBINED_SUB_FILE="$root/all-sub.txt"
     SERVED_SUB_FILE="$root/sub.txt"; RESULT_DIR="$root/history"
@@ -2041,14 +2117,14 @@ probe_vless_edge_candidate() {
 probe_vless_edge_attempts() {
         local original_url="$1" edge_address="$2" host sni path port tls_host request_host
         local resolve_address status header_file ws_key expected_accept curl_status pid='' stage=''
-        local attempts="${CFY_HEALTH_PROBE_ATTEMPTS:-2}" minimum="${CFY_HEALTH_MIN_SUCCESS:-1}"
-        local max_time="${CFY_HEALTH_MAX_TIME:-5}" connect_time="${CFY_HEALTH_CONNECT_TIMEOUT:-3}"
+        local attempts="${CFY_HEALTH_PROBE_ATTEMPTS:-1}" minimum="${CFY_HEALTH_MIN_SUCCESS:-1}"
+        local max_time="${CFY_HEALTH_MAX_TIME:-3}" connect_time="${CFY_HEALTH_CONNECT_TIMEOUT:-2}"
         local success_count=0 attempt reason=network stopped
-        [[ "$attempts" =~ ^[1-4]$ ]] || attempts=2
+        [[ "$attempts" =~ ^[1-4]$ ]] || attempts=1
         [[ "$minimum" =~ ^[1-4]$ ]] || minimum=1
         [ "$minimum" -le "$attempts" ] || minimum=$attempts
-        [[ "$max_time" =~ ^([1-9]|1[0-5])$ ]] || max_time=5
-        [[ "$connect_time" =~ ^([1-9]|1[0-5])$ ]] || connect_time=3
+        [[ "$max_time" =~ ^([1-9]|1[0-5])$ ]] || max_time=3
+        [[ "$connect_time" =~ ^([1-9]|1[0-5])$ ]] || connect_time=2
         [ "$connect_time" -le "$max_time" ] || connect_time=$max_time
         trap '[ -z "$pid" ] || { kill "$pid" 2>/dev/null || :; wait "$pid" 2>/dev/null || :; }; [ -z "$stage" ] || rm -rf -- "$stage"' EXIT
         trap 'exit 130' INT
@@ -2123,22 +2199,135 @@ probe_vless_edge_attempts() {
         exit 1
 }
 
+read_cfy_cgroup_budget() {
+    local directory="$1" limit='' usage='' bytes kb available
+    CFY_CGROUP_RECORD_VALID=0
+    if [ -r "$directory/memory.max" ]; then
+        IFS= read -r limit < "$directory/memory.max" || :
+        [ ! -r "$directory/memory.current" ] || IFS= read -r usage < "$directory/memory.current" || :
+    elif [ -r "$directory/memory.limit_in_bytes" ]; then
+        IFS= read -r limit < "$directory/memory.limit_in_bytes" || :
+        [ ! -r "$directory/memory.usage_in_bytes" ] || IFS= read -r usage < "$directory/memory.usage_in_bytes" || :
+    fi
+    # Distinguish valid unlimited accounting from unreadable/malformed data.
+    if [ "$limit" = max ]; then CFY_CGROUP_RECORD_VALID=1; return 0; fi
+    [[ "$limit" =~ ^[0-9]{1,19}$ ]] || return 0
+    while [ "${#limit}" -gt 1 ] && [ "${limit:0:1}" = 0 ]; do limit=${limit:1}; done
+    if [ "${#limit}" -gt 16 ]; then CFY_CGROUP_RECORD_VALID=1; return 0; fi
+    bytes=$((10#$limit)); [ "$bytes" -gt 0 ] || return 0
+    CFY_CGROUP_RECORD_VALID=1
+    kb=$((bytes / 1024))
+    if [ "$CFY_EFFECTIVE_TOTAL_KB" -eq 0 ] || [ "$kb" -lt "$CFY_EFFECTIVE_TOTAL_KB" ]; then
+        CFY_EFFECTIVE_TOTAL_KB=$kb
+    fi
+    if [[ "$usage" =~ ^[0-9]{1,16}$ ]]; then
+        available=$(( (bytes - 10#$usage) / 1024 )); [ "$available" -ge 1 ] || available=1
+        if [ "$CFY_EFFECTIVE_AVAILABLE_KB" -eq 0 ] || [ "$available" -lt "$CFY_EFFECTIVE_AVAILABLE_KB" ]; then
+            CFY_EFFECTIVE_AVAILABLE_KB=$available
+        fi
+    fi
+}
+
+scan_cfy_cgroup_path() {
+    local directory="$1" base="$2" steps=0
+    while [[ "$directory" == "$base" || "$directory" == "$base/"* ]]; do
+        read_cfy_cgroup_budget "$directory"
+        if [ "$steps" = 0 ] && [ "$CFY_CGROUP_RECORD_VALID" = 1 ]; then CFY_CGROUP_RESOLVED=1; fi
+        [ "$directory" != "$base" ] || break
+        directory=${directory%/*}; steps=$((steps+1))
+        [ "$steps" -lt 64 ] || break
+    done
+}
+
+get_cfy_memory_budget() {
+    # Optional paths are fixture inputs; normal callers use kernel-provided data.
+    local meminfo="${1:-/proc/meminfo}" root="${2:-/sys/fs/cgroup}" membership="${3:-/proc/self/cgroup}" mountinfo="${4:-/proc/self/mountinfo}"
+    local key value units hierarchy controllers path base observed=0 is_v2 mount_root mountpoint fs options separator index relative
+    local -a fields=()
+    CFY_EFFECTIVE_TOTAL_KB=0; CFY_EFFECTIVE_AVAILABLE_KB=0; CFY_CGROUP_RESOLVED=0
+    if [ -r "$meminfo" ]; then
+        while read -r key value units; do
+            [[ "$value" =~ ^[0-9]{1,12}$ ]] || continue
+            case "$key" in
+                MemTotal:) CFY_EFFECTIVE_TOTAL_KB=$((10#$value)) ;;
+                MemAvailable:) CFY_EFFECTIVE_AVAILABLE_KB=$((10#$value)) ;;
+            esac
+        done < "$meminfo"
+    fi
+    read_cfy_cgroup_budget "$root"
+    read_cfy_cgroup_budget "$root/memory"
+    [ -r "$membership" ] || return 0
+    while IFS=: read -r hierarchy controllers path; do
+        [[ "$path" == /* && "$path" != *'/../'* && "$path" != */.. ]] || continue
+        if [ -z "$controllers" ]; then base=$root; is_v2=1
+        elif [[ ",$controllers," == *,memory,* ]]; then base="$root/memory"; is_v2=0
+        else continue; fi
+        observed=1
+        scan_cfy_cgroup_path "${base}${path%/}" "$base"
+        [ -r "$mountinfo" ] || continue
+        while read -r -a fields; do
+            separator=-1
+            for index in "${!fields[@]}"; do
+                [ "${fields[$index]}" != - ] || { separator=$index; break; }
+            done
+            [ "$separator" -ge 6 ] && [ "${#fields[@]}" -gt $((separator+3)) ] || continue
+            fs=${fields[$((separator+1))]}; options=${fields[$((separator+3))]}
+            if [ "$is_v2" = 1 ]; then [ "$fs" = cgroup2 ] || continue
+            else [ "$fs" = cgroup ] && [[ ",$options," == *,memory,* ]] || continue; fi
+            mount_root=${fields[3]//\\040/ }; mountpoint=${fields[4]//\\040/ }
+            [[ "$root" == /sys/fs/cgroup || "$mountpoint" == "$root" || "$mountpoint" == "$root/"* ]] || continue
+            if [ "$path" = "$mount_root" ]; then relative=''
+            elif [ "$mount_root" = / ]; then relative=${path#/}
+            elif [[ "$path" == "$mount_root/"* ]]; then relative=${path#"$mount_root"/}
+            else relative=${path#/}; fi
+            # The last case covers namespace-relative membership paths.
+            scan_cfy_cgroup_path "${mountpoint}${relative:+/$relative}" "$mountpoint"
+        done < "$mountinfo"
+    done < "$membership"
+    # A visible cgroup membership with hidden/unmapped accounting is not proof
+    # of host-sized capacity. Prefer one worker rather than guessing or refusing.
+    if [ "$observed" = 1 ] && [ "$CFY_CGROUP_RESOLVED" = 0 ]; then CFY_EFFECTIVE_TOTAL_KB=0; fi
+}
+
+get_cfy_probe_concurrency() {
+    if [[ "${CFY_HEALTH_CONCURRENCY:-}" =~ ^[1-6]$ ]]; then
+        printf '%s\n' "$CFY_HEALTH_CONCURRENCY"; return 0
+    fi
+    get_cfy_memory_budget
+    if [ "$CFY_EFFECTIVE_TOTAL_KB" -eq 0 ] || [ "$CFY_EFFECTIVE_TOTAL_KB" -le 196608 ] ||
+       { [ "$CFY_EFFECTIVE_AVAILABLE_KB" -gt 0 ] && [ "$CFY_EFFECTIVE_AVAILABLE_KB" -lt 98304 ]; }; then
+        printf '1\n'
+    elif [ "$CFY_EFFECTIVE_TOTAL_KB" -le 393216 ] ||
+         { [ "$CFY_EFFECTIVE_AVAILABLE_KB" -gt 0 ] && [ "$CFY_EFFECTIVE_AVAILABLE_KB" -lt 163840 ]; }; then
+        printf '2\n'
+    else printf '3\n'; fi
+}
+
 screen_edge_candidates_impl() {
-        local kind="$1" template="$2" json='' dir='' pid start index end reason
-        local concurrency="${CFY_HEALTH_CONCURRENCY:-3}" total=${#ip_list[@]}
+        local kind="$1" template="$2" json='' dir='' pid index next=0 slot reason
+        local concurrency total=${#ip_list[@]}
+        concurrency=$(get_cfy_probe_concurrency) || exit 1
         local -a pids=()
-        [[ "$concurrency" =~ ^[1-6]$ ]] || concurrency=3
+        [[ "$concurrency" =~ ^[1-6]$ ]] || concurrency=1
         umask 077
         dir=$(mktemp -d) || exit 1
         trap 'for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null || :; done; for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || :; done; rm -rf -- "$dir"' EXIT
         trap 'exit 130' INT
         trap 'exit 143' TERM HUP
         if [ "$kind" = vmess ]; then json=$(decode_vmess_template "$template") || exit 1; fi
-        printf '正在检查 %s 个入口（最多 %s 个并行）...\n' "$total" "$concurrency" >&2
-        for ((start=0; start<total; start+=concurrency)); do
-            end=$((start + concurrency)); [ "$end" -le "$total" ] || end=$total
-            pids=()
-            for ((index=start; index<end; index++)); do
+        printf '正在检查 %s 个入口（滚动调度，最多 %s 个并行）...\n' "$total" "$concurrency" >&2
+        # Refill any completed slot immediately; never wait for a whole batch.
+        while [ "$next" -lt "$total" ] || [ "${#pids[@]}" -gt 0 ]; do
+            for slot in "${!pids[@]}"; do
+                pid=${pids[$slot]}
+                if ! kill -0 "$pid" 2>/dev/null; then
+                    wait "$pid" || exit 1
+                    unset 'pids[slot]'
+                fi
+            done
+            while [ "$next" -lt "$total" ] && [ "${#pids[@]}" -lt "$concurrency" ]; do
+                index=$next
+                next=$((next + 1))
                 (
                     local worker_pid='' worker_rc=0
                     trap '[ -z "$worker_pid" ] || { kill "$worker_pid" 2>/dev/null || :; wait "$worker_pid" 2>/dev/null || :; }' EXIT
@@ -2159,14 +2348,41 @@ screen_edge_candidates_impl() {
                     fi
                     printf '[%s/%s] %s：%s\n' "$((index+1))" "$total" "${ip_list[$index]}" "$(cfy_probe_reason "$reason")" >&2
                 ) &
-                pids+=("$!")
+                pids[$index]=$!
             done
-            for pid in "${pids[@]}"; do wait "$pid" || exit 1; done
-            pids=()
+            [ "${#pids[@]}" -eq 0 ] || sleep 0.02
         done
         for ((index=0; index<total; index++)); do
             if [ -f "$dir/$index.ok" ]; then printf '%s\n' "$index"; fi
         done
+}
+
+load_edge_candidates_from_file() {
+    local file="$1" line host port
+    [ -f "$file" ] && [ -r "$file" ] && [ ! -L "$file" ] || {
+        printf '入口文件不存在、不可读或是符号链接。\n' >&2; return 1;
+    }
+    ip_list=(); isp_list=()
+    local -A seen=()
+    while IFS= read -r line || [ -n "$line" ]; do
+        line=${line%%#*}; line=${line//$'\r'/}
+        line=${line#"${line%%[![:space:]]*}"}; line=${line%"${line##*[![:space:]]}"}
+        [ -n "$line" ] || continue
+        normalize_edge_input "$line" 443
+        host=$EDGE_HOST; port=$EDGE_PORT
+        is_valid_optimized_ip_literal "$host" both &&
+            [[ "$port" =~ ^[0-9]{1,5}$ ]] &&
+            [ "$((10#$port))" -gt 0 ] && [ "$((10#$port))" -le 65535 ] || {
+                printf '入口文件含无效 IP 或端口，请修正后重试。\n' >&2; return 1;
+            }
+        # Bare IPs keep the template's port; explicit ports remain explicit.
+        [[ -z "${seen[$line]+x}" ]] || continue
+        seen[$line]=1
+        ip_list+=("$line"); isp_list+=(local)
+        [ "${#ip_list[@]}" -lt 30 ] || break
+    done < "$file"
+    [ "${#ip_list[@]}" -gt 0 ] || { printf '入口文件没有有效候选。\n' >&2; return 1; }
+    printf '已读取 %s 个本地入口（每次最多 30 个）。\n' "${#ip_list[@]}"
 }
 
 screen_edge_candidates() {
@@ -2193,7 +2409,7 @@ screen_edge_candidates() {
     ip_list=("${kept_ips[@]}"); isp_list=("${kept_isps[@]}")
     printf '检查完成：%s/%s 个入口握手通过。\n' "${#ip_list[@]}" "$total" >&2
     if [ ${#ip_list[@]} -eq 0 ]; then
-        printf '本机未找到通过检查的入口，原订阅保持不变。请检查原节点或更换节点模板。\n' >&2
+        printf '本机未找到通过检查的入口，原订阅保持不变。慢网络可增加 CFY_HEALTH_PROBE_ATTEMPTS=2、CFY_HEALTH_MAX_TIME=5 后重试原命令\n' >&2
         return 1
     fi
 }
@@ -2331,7 +2547,7 @@ main() {
     load_source_urls
     local load_status=$?
     if [ "$load_status" -ne 0 ]; then
-        echo -e "${RED}读取 Sing-box 模板失败；订阅锁不可用或超时。${NC}" >&2
+        echo -e "${RED}读取节点源失败：文件无效、读取期间变化或订阅锁不可用。${NC}" >&2
         return "$load_status"
     fi
     if [ ${#urls[@]} -gt 0 ]; then
@@ -2379,48 +2595,72 @@ main() {
     fi
     echo -e "${GREEN}已选择: $original_ps${NC}"
 
-    echo -e "${YELLOW}请选择要使用的 IP 地址来源:${NC}"
-    echo "  1) Cloudflare 官方网段候选（非测速优选）"
-    echo "  2) 云优选  "
-
-    local ip_source_choice; local use_optimized_ips=false; local IP_VERSION_SCOPE="ipv4"
-    while true; do
-        read -p "请输入选项编号 (1-2): " ip_source_choice || return 1
-        if [[ "$ip_source_choice" == "1" ]]; then break;
-        elif [[ "$ip_source_choice" == "2" ]]; then use_optimized_ips=true; break;
-        else echo -e "${RED}无效的输入, 请重试.${NC}"; fi
-    done
-
+    local ip_source_choice; local use_optimized_ips=false use_custom_edges=false
+    local IP_VERSION_SCOPE="ipv4"
     declare -a ip_list isp_list; local num_to_generate=0
-    if $use_optimized_ips; then
-        choose_ip_version_scope
-        get_all_optimized_ips || exit 1
-        num_to_generate=0
+    if [ -n "${CFY_EDGE_FILE:-}" ]; then
+        load_edge_candidates_from_file "$CFY_EDGE_FILE" || return 1
+        use_custom_edges=true
     else
-        echo -e "${YELLOW}正在从 Cloudflare 官网获取 IPv4 地址列表...${NC}"
-        cloudflare_ips=$(curl -fsSL --connect-timeout "$CFY_CURL_CONNECT_TIMEOUT" --max-time "$CFY_CURL_MAX_TIME" https://www.cloudflare.com/ips-v4 2>/dev/null || true)
-        if [ -z "$cloudflare_ips" ]; then echo -e "${RED}无法获取 Cloudflare IP 列表.${NC}"; exit 1; fi
-        mapfile -t ip_list <<< "$cloudflare_ips"
-        echo -e "${GREEN}成功获取 ${#ip_list[@]} 个 Cloudflare IPv4 地址段.${NC}"
         while true; do
-            read -p "请输入候选检查数量 (1-30): " num_to_generate || return 1
-            if [[ "$num_to_generate" =~ ^[0-9]{1,2}$ ]] && [ "$num_to_generate" -gt 0 ] && [ "$num_to_generate" -le 30 ]; then break;
-            else echo -e "${RED}请输入一个有效的正整数.${NC}"; fi
+            echo '请选择入口来源（回车使用云优选）：'
+            echo '  1) Cloudflare 官方网段候选（非测速优选）'
+            echo '  2) 云优选'
+            echo '  3) 本地 IP 文件（无需等待云数据源）'
+            echo '  0) 取消'
+            read -r -p '请输入编号 [0-3，默认 2]: ' ip_source_choice || return 1
+            ip_source_choice=${ip_source_choice:-2}
+            case "$ip_source_choice" in
+                0) return 1 ;;
+                3)
+                    local edge_file
+                    read -r -p '本地入口文件路径: ' edge_file || return 1
+                    if load_edge_candidates_from_file "$edge_file"; then
+                        use_custom_edges=true; break
+                    fi
+                    ;;
+                2)
+                    choose_ip_version_scope
+                    if get_all_optimized_ips; then use_optimized_ips=true; break; fi
+                    echo '云数据源暂不可用。可选择 3 使用本地 IP 文件，或选择 1；原结果未修改。' >&2
+                    ;;
+                1)
+                    echo '正在从 Cloudflare 官网获取 IPv4 地址列表...'
+                    cloudflare_ips=$(curl -q -fsSL --retry 0 --connect-timeout 3 --max-time 6 https://www.cloudflare.com/ips-v4 2>/dev/null || true)
+                    if [ -z "$cloudflare_ips" ]; then
+                        echo '官方列表获取失败，可选择 3 使用本地 IP 文件。' >&2; continue
+                    fi
+                    mapfile -t ip_list <<< "$cloudflare_ips"
+                    echo "取得 ${#ip_list[@]} 个 Cloudflare IPv4 地址段。"
+                    while true; do
+                        read -r -p '请输入候选检查数量 (1-30): ' num_to_generate || return 1
+                        if [[ "$num_to_generate" =~ ^[0-9]{1,2}$ ]] && [ "$num_to_generate" -gt 0 ] && [ "$num_to_generate" -le 30 ]; then break; fi
+                        echo '请输入 1-30 的正整数。' >&2
+                    done
+                    break
+                    ;;
+                *) echo '编号无效，请重新输入。' >&2 ;;
+            esac
         done
+
     fi
 
     # Prepare once, then check a bounded batch instead of blocking per URL.
-    if ! $use_optimized_ips; then
+    if ! $use_optimized_ips && ! $use_custom_edges; then
+        local -A seen_candidates=()
         local -a ranges=("${ip_list[@]}") candidates=()
         local range candidate
         for ((i=0; i<num_to_generate; i++)); do
             range=${ranges[$((RANDOM % ${#ranges[@]}))]}
             candidate=$(cidr_to_usable_ip "$range") || return 1
+            [[ -z "${seen_candidates[$candidate]+x}" ]] || continue
+            seen_candidates[$candidate]=1
             candidates+=("$candidate")
         done
         ip_list=("${candidates[@]}"); isp_list=()
     fi
     screen_edge_candidates "$selected_type" "$selected_url" || return 1
+    echo '本机握手检查不等于客户端可用；实际速度与代理认证请在客户端验证。'
     echo '---'; echo '生成的新节点链接如下：'
     local current_ip isp_group ip_version name_key new_ps generated_url name_prefix
     local -A name_counts=()
