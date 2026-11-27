@@ -32,10 +32,10 @@ grep -q '本机检查超时' "$d/progress"
 ALL_FAIL=1
 if screen_edge_candidates vless fixture 2>/dev/null; then echo 'all-failed screening accepted'; exit 1; fi
 [[ ${#ip_list[@]} == 0 ]]
-# Disabling the optional check remains explicit and never labels candidates verified.
+# Default generation never labels candidates verified or invokes the probe.
 CFY_HEALTH_PROBE=0
 ip_list=(192.0.2.9); isp_list=(fixture)
 screen_edge_candidates vless fixture 2> "$d/skipped"
 [[ "${ip_list[*]}" == 192.0.2.9 ]]
-grep -q '未检查握手' "$d/skipped"
+[[ ! -s "$d/skipped" ]]
 echo 'Parallel cap, ordered results, transient failure labels and empty-result tests passed.'

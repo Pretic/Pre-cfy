@@ -48,21 +48,21 @@ cat > "${fixture}" <<'EOF'
 2606:4700::11|Mobile|00000027
 EOF
 
-collect_ranked_optimized_pairs "${fixture}" 10 both 2>"${rank_stderr}"
+collect_ranked_optimized_pairs "${fixture}" 0 both 2>"${rank_stderr}"
 
 if [[ -s "${rank_stderr}" ]]; then
     echo "FAIL: large decimal RTT comparison wrote to stderr: $(<"${rank_stderr}")" >&2
     exit 1
 fi
 
-expected_ips="104.17.0.10 104.17.0.11 104.17.0.6 104.17.0.5 104.17.0.7 104.17.0.8 104.17.0.9 2606:4700::10 2606:4700::11 2606:4700::6 2606:4700::5 2606:4700::7 2606:4700::8 2606:4700::9"
+expected_ips="104.17.0.1 104.17.0.2 104.17.0.3 104.17.0.4 104.17.0.5 104.17.0.6 104.17.0.7 104.17.0.8 104.17.0.9 104.17.0.10 104.17.0.11 2606:4700::1 2606:4700::2 2606:4700::3 2606:4700::4 2606:4700::5 2606:4700::6 2606:4700::7 2606:4700::8 2606:4700::9 2606:4700::10 2606:4700::11"
 if [[ "${ip_list[*]}" != "${expected_ips}" ]]; then
-    echo "FAIL: valid decimal RTT candidates were not filtered and ranked correctly: ${ip_list[*]}" >&2
+    echo "FAIL: valid IP candidates were lost because of optional RTT fields: ${ip_list[*]}" >&2
     exit 1
 fi
 
-if [[ "${#ip_list[@]}" -ne 14 ]]; then
-    echo "FAIL: sparse quality results must not be padded to the per-group limit" >&2
+if [[ "${#ip_list[@]}" -ne 22 ]]; then
+    echo "FAIL: unlimited generation must preserve all distinct IPs" >&2
     exit 1
 fi
 
@@ -75,7 +75,7 @@ RED=''
 NC=''
 CFY_CURL_CONNECT_TIMEOUT=1
 CFY_CURL_MAX_TIME=1
-CFY_PER_ISP_LIMIT=5
+CFY_PER_ISP_LIMIT=0
 IP_VERSION_SCOPE=both
 
 curl() {
@@ -112,10 +112,13 @@ curl() {
 }
 
 get_all_optimized_ips >/dev/null
-expected_ips="104.18.0.7 104.18.0.6 2606:4700:1::7 2606:4700:1::6"
+expected_ips="104.18.0.1 104.18.0.2 104.18.0.3 104.18.0.4 104.18.0.5 104.18.0.6 104.18.0.7 2606:4700:1::1 2606:4700:1::2 2606:4700:1::3 2606:4700:1::4 2606:4700:1::5 2606:4700:1::6 2606:4700:1::7"
 if [[ "${ip_list[*]}" != "${expected_ips}" ]]; then
-    echo "FAIL: HTML parsing admitted invalid RTT candidates: ${ip_list[*]}" >&2
+    echo "FAIL: HTML parsing lost valid IPs or admitted a malformed/wrong-family IP: ${ip_list[*]}" >&2
     exit 1
 fi
 
-echo 'Invalid candidate RTT filtering tests passed.'
+CFY_PER_ISP_LIMIT=2
+get_all_optimized_ips >/dev/null
+[[ "${ip_list[*]}" == '104.18.0.7 104.18.0.6 2606:4700:1::7 2606:4700:1::6' ]]
+echo 'Unknown RTT preservation, IP validation and opt-in ranked selection tests passed.'

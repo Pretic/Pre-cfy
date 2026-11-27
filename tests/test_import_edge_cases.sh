@@ -25,6 +25,7 @@ if load_source_urls 2>/dev/null; then echo 'invalid import accepted'; exit 1; fi
 [[ ! -e "$RESULT_FILE" ]]
 [[ "$(get_vless_ps "$v")" == 'Hong Kong+1' ]]
 [[ "$(get_vless_ps "${v%#*}#Hong+Kong")" == 'Hong+Kong' ]]
+[[ "$(get_vless_ps "${v%#*}#Hong\\node")" == 'Hong\node' ]]
 updated=$(update_vless_url "$v" 104.16.0.1 "$(get_vless_ps "$v")-CF1")
 [[ "$updated" == *'#Hong%20Kong%2B1-CF1' ]]
 printf '%s\n' "$v" 'hysteria2://fixture@hy.example.com:443#HY2' 'tuic://id:secret@tuic.example.com:443#TUIC' > "$d/raw"

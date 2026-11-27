@@ -12,7 +12,20 @@ for bad in 'example.com' '104.16.0.1:0' '104.16.0.1:99999' '[2606:4700::1]:abc';
 done
 for i in {1..40}; do printf '104.16.0.%s\n' "$i"; done > "$d/many"
 load_edge_candidates_from_file "$d/many"
-[[ ${#ip_list[@]} == 30 ]]
+[[ ${#ip_list[@]} == 40 ]]
+# Official CIDRs must produce actual distinct in-range host addresses rather
+# than always returning network+1. Malformed remote text is never an endpoint.
+declare -A sampled=()
+for i in {1..128}; do
+ edge=$(cidr_to_usable_ip 192.0.2.0/24)
+ [[ "$edge" == 192.0.2.* && "${edge##*.}" -gt 0 && "${edge##*.}" -lt 255 ]]
+ sampled[$edge]=1
+done
+[[ ${#sampled[@]} -gt 40 ]]
+[[ "$(cidr_to_usable_ip 192.0.2.7/32)" == 192.0.2.7 ]]
+for bad in 'not-a-cidr' '999.1.1.0/24' '192.0.2.0/33' '192.0.2.0/-1'; do
+ if cidr_to_usable_ip "$bad" >/dev/null 2>&1; then echo 'invalid CIDR accepted'; exit 1; fi
+done
 # This path needs no provider request or IP-stack detection.
 GREEN='' RED='' YELLOW='' NC=''; URL_FILE="$d/nodes"; : > "$URL_FILE"
 load_source_urls() { urls=('vless://fixture'); }
@@ -26,7 +39,7 @@ finalize_generated_urls() { [[ "$1" == 4 ]]; }
 CFY_EDGE_FILE="$d/ips"
 printf '\n' > "$d/choice"
 main < "$d/choice" > "$d/log"
-echo 'Local candidate import, deduplication, bounds and network-free selection tests passed.'
+echo 'Local candidate import, deduplication, full-file reading and network-free selection tests passed.'
 # A failed default cloud fetch returns to the menu with the chosen template
 # intact; the user can recover locally in the same run without an env variable.
 unset CFY_EDGE_FILE

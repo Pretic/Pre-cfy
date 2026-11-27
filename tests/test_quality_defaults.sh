@@ -4,7 +4,7 @@ script="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/cfy.sh"
 d=$(mktemp -d); trap 'rm -rf "$d"' EXIT
 unset CFY_HEALTH_PROBE
 source <(grep '^CFY_HEALTH_PROBE=' "$script")
-[[ "$CFY_HEALTH_PROBE" == 1 ]]
+[[ "$CFY_HEALTH_PROBE" == 0 ]]
 unset CFY_HEALTH_PROBE_ATTEMPTS CFY_HEALTH_MAX_TIME CFY_HEALTH_CONNECT_TIMEOUT
 source <(grep -E '^CFY_HEALTH_(PROBE_ATTEMPTS|MAX_TIME|CONNECT_TIMEOUT)=' "$script")
 [[ "$CFY_HEALTH_PROBE_ATTEMPTS" == 1 && "$CFY_HEALTH_MAX_TIME" == 3 && "$CFY_HEALTH_CONNECT_TIMEOUT" == 2 ]]
@@ -19,13 +19,18 @@ select_vmess_template() { :; }
 get_vless_ps() { echo fixture; }
 curl() { echo 104.16.0.0/13; }
 cidr_to_usable_ip() { echo 104.16.0.1; }
-probe_vless_edge_candidate() { return "${PROBE_RC:-0}"; }
+probe_vless_edge_candidate() { : > "$d/probed"; return "${PROBE_RC:-0}"; }
 update_vless_url() { echo "vless://fixture#$3"; }
 finalize_generated_urls() { echo "$1" > "$d/published"; }
 printf '1\n1\n3\n' > "$d/choices"
+PROBE_RC=1
 (main < "$d/choices") > "$d/log" 2>&1
-# Repeated selections from one official range are checked and emitted once.
+# Default generation does not depend on this VPS reaching the client endpoint.
 [[ "$(cat "$d/published")" == 1 ]]
+[[ ! -e "$d/probed" ]]
+CFY_HEALTH_PROBE=1; PROBE_RC=0
+(main < "$d/choices") > "$d/log" 2>&1
+[[ "$(cat "$d/published")" == 1 && -f "$d/probed" ]]
 rm "$d/published"
 PROBE_RC=1
 if (main < "$d/choices") > "$d/log" 2>&1; then exit 1; fi
@@ -37,4 +42,4 @@ sed -n '/^case /,/^esac/p' "$script" >> "$d/dispatch.sh"
 rc=0
 bash "$d/dispatch.sh" --update || rc=$?
 [[ "$rc" == 42 ]]
-echo 'Default health checks, no-empty-publication, EOF and update status tests passed.'
+echo 'Fast default generation, opt-in checks, no-empty-publication, EOF and update status tests passed.'

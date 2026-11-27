@@ -29,10 +29,10 @@ CFY_CURL_CONNECT_TIMEOUT="${CFY_CURL_CONNECT_TIMEOUT:-3}"
 CFY_CURL_MAX_TIME="${CFY_CURL_MAX_TIME:-6}"
 CFY_SOURCE_MAX_TIME="${CFY_SOURCE_MAX_TIME:-16}"
 CFY_OPTIMIZED_IP_API_URL="${CFY_OPTIMIZED_IP_API_URL:-https://www.wetest.vip/api/cf2dns/get_cloudflare_ip}"
-CFY_OPTIMIZED_IP_API_KEY="${CFY_OPTIMIZED_IP_API_KEY:-o1zrmHAF}"
+CFY_OPTIMIZED_IP_API_KEY="${CFY_OPTIMIZED_IP_API_KEY:-}"
 CFY_IP_VERSION_SCOPE="${CFY_IP_VERSION_SCOPE:-}"
 CFY_PER_ISP_LIMIT="${CFY_PER_ISP_LIMIT:-}"
-CFY_HEALTH_PROBE="${CFY_HEALTH_PROBE:-1}"
+CFY_HEALTH_PROBE="${CFY_HEALTH_PROBE:-0}"
 CFY_HEALTH_PROBE_ATTEMPTS="${CFY_HEALTH_PROBE_ATTEMPTS:-1}"
 CFY_HEALTH_MIN_SUCCESS="${CFY_HEALTH_MIN_SUCCESS:-1}"
 CFY_HEALTH_CONCURRENCY="${CFY_HEALTH_CONCURRENCY:-}"
@@ -246,7 +246,8 @@ show_help() {
     echo "      --update  更新 cfy 脚本后退出"
     echo "  -h, --help    显示帮助"
     echo "  本地入口文件: CFY_EDGE_FILE=/路径/ips.txt cfy（跳过云数据源）"
-    echo "VLESS/VMess WS+TLS 可用于 Cloudflare CDN、Tunnel、Workers；默认验证握手。"
+    echo "  可选握手筛选: CFY_HEALTH_PROBE=1 cfy"
+    echo "VLESS/VMess WS+TLS 可用于 Cloudflare CDN、Tunnel、Workers；默认直接生成双栈候选。"
 }
 
 show_update_done() {
@@ -337,7 +338,7 @@ show_saved_results_locked() {
     if [ ! -s "$RESULT_FILE" ]; then
         echo -e "${YELLOW}尚未找到已保存的优选节点，请先运行 cfy 生成一次。${NC}"
         if show_source_templates; then
-            echo -e "${YELLOW}以上是 Sing-box 已创建的 VLESS-WS-TLS-Argo 模板节点，运行 cfy 后会生成优选节点并保存。${NC}"
+            echo -e "${YELLOW}以上是已有 WS+TLS 模板节点，运行 cfy 后会生成优选节点并保存。${NC}"
             return 0
         fi
         return 1
@@ -1409,6 +1410,9 @@ normalize_edge_latency() {
 decimal_latency_less_than() {
     local left="$1" right="$2" index left_digit right_digit
 
+    # An absent or unrecognized RTT is unknown, not a failed endpoint.
+    [ -n "$left" ] || return 1
+    [ -n "$right" ] || return 0
     if [ "${#left}" -lt "${#right}" ]; then
         return 0
     elif [ "${#left}" -gt "${#right}" ]; then
@@ -1448,7 +1452,7 @@ check_deps() {
 
 collect_ranked_optimized_pairs() {
     local source_file="$1"
-    local per_group_limit="${2:-3}"
+    local per_group_limit="${2:-0}"
     local ip_scope="${3:-both}"
     local line edge_ip edge_isp edge_latency edge_version group_key
     local index group slot best_index best_latency desired_version
@@ -1457,15 +1461,14 @@ collect_ranked_optimized_pairs() {
     declare -A seen_groups=()
     declare -A selected_indices=()
 
-    if [[ ! "$per_group_limit" =~ ^[1-9][0-9]*$ ]]; then
-        per_group_limit=3
-    fi
+    [[ "$per_group_limit" =~ ^[0-9]{1,9}$ ]] || per_group_limit=0
+    per_group_limit=$((10#$per_group_limit))
 
     while IFS='|' read -r edge_ip edge_isp edge_latency || [ -n "$edge_ip" ]; do
         edge_ip=$(printf '%s' "$edge_ip" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
         edge_isp=$(printf '%s' "${edge_isp:-CF}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/[[:space:]]\+/_/g')
         is_valid_edge_address "$edge_ip" || continue
-        edge_latency=$(normalize_edge_latency "$edge_latency") || continue
+        edge_latency=$(normalize_edge_latency "$edge_latency") || edge_latency=''
         if [[ -n "${seen_edges[$edge_ip]+x}" ]]; then
             continue
         fi
@@ -1489,6 +1492,18 @@ collect_ranked_optimized_pairs() {
 
     ip_list=()
     isp_list=()
+    # By default keep every distinct source candidate. Provider RTTs describe
+    # the provider's network, so they must not prune the client's choices.
+    if [ "$per_group_limit" -eq 0 ]; then
+        for desired_version in ipv4 ipv6; do
+            for ((index=0; index<${#candidate_ips[@]}; index++)); do
+                [ "${candidate_groups[$index]##*|}" = "$desired_version" ] || continue
+                ip_list+=("${candidate_ips[$index]}")
+                isp_list+=("${candidate_isps[$index]}")
+            done
+        done
+        return 0
+    fi
     for desired_version in ipv4 ipv6; do
         case "$ip_scope" in
             ipv4) [ "$desired_version" = "ipv4" ] || continue ;;
@@ -1517,14 +1532,10 @@ collect_ranked_optimized_pairs() {
 }
 
 get_candidate_group_limit() {
-    local ip_scope="$1"
-
-    if [[ "${CFY_PER_ISP_LIMIT:-}" =~ ^[1-9][0-9]*$ ]]; then
-        printf '%s\n' "$CFY_PER_ISP_LIMIT"
-    elif [ "$ip_scope" = "both" ]; then
-        printf '%s\n' "3"
+    if [[ "${CFY_PER_ISP_LIMIT:-}" =~ ^[0-9]{1,9}$ ]]; then
+        printf '%s\n' "$((10#$CFY_PER_ISP_LIMIT))"
     else
-        printf '%s\n' "5"
+        printf '%s\n' "0"
     fi
 }
 
@@ -1574,7 +1585,7 @@ parse_wetest_api_payload() {
         case "$expected_version" in
             ipv4|ipv6) [ "$actual_version" = "$expected_version" ] || continue ;;
         esac
-        normalized_latency=$(normalize_edge_latency "$latency") || continue
+        normalized_latency=$(normalize_edge_latency "$latency") || normalized_latency=''
         normalized_isp=$(printf '%s' "$isp" | tr '[:upper:]' '[:lower:]')
         case "$normalized_isp" in
             cm) isp="Mobile" ;;
@@ -1592,7 +1603,7 @@ get_all_optimized_ips() {
     local url_v4="https://www.wetest.vip/page/cloudflare/address_v4.html"
     local url_v6="https://www.wetest.vip/page/cloudflare/address_v6.html"
     local api_url="${CFY_OPTIMIZED_IP_API_URL:-https://www.wetest.vip/api/cf2dns/get_cloudflare_ip}"
-    local api_key="${CFY_OPTIMIZED_IP_API_KEY:-o1zrmHAF}"
+    local api_key="${CFY_OPTIMIZED_IP_API_KEY:-}"
 
     case "$IP_VERSION_SCOPE" in
         ipv4|ipv6|both) ;;
@@ -1607,7 +1618,8 @@ get_all_optimized_ips() {
     source_deadline=$((SECONDS + source_budget))
     # Reserve a fair attempt for each family and its fallback. A slow IPv4
     # provider must not consume the entire IPv6 opportunity.
-    request_share=2; [ "$IP_VERSION_SCOPE" != both ] || request_share=4
+    request_share=1; [ "$IP_VERSION_SCOPE" != both ] || request_share=2
+    [ -z "$api_key" ] || request_share=$((request_share * 2))
     request_budget=$((source_budget / request_share))
     printf '云数据源总等待预算 %s 秒；超时可改用本地入口文件。\n' "$source_budget"
     paired_data_file=$(mktemp) || return 1
@@ -1652,7 +1664,7 @@ get_all_optimized_ips() {
             ip=$(printf '%s' "$ip" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
             isp=$(printf '%s' "${isp:-CF}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/[[:space:]]\+/_/g')
             is_valid_optimized_ip_literal "$ip" "$expected_version" || continue
-            latency=$(normalize_edge_latency "$latency") || continue
+            latency=$(normalize_edge_latency "$latency") || latency=''
             printf '%s|%s|%s\n' "$ip" "${isp:-CF}" "$latency" >> "$paired_data_file"
         done <<< "$table_rows"
     }
@@ -1660,18 +1672,21 @@ get_all_optimized_ips() {
     fetch_family() {
         local api_type="$1" expected_version="$2" html_url="$3" type_desc="$4" api_content
 
-        echo -e "  -> 正在获取 ${type_desc} 列表..."
-        api_content=$(fetch_candidate_source --get \
-            --data-urlencode "key=${api_key}" \
-            --data-urlencode "type=${api_type}" \
-            "$api_url" 2>/dev/null || true)
-        if [ -n "$api_content" ] && \
-           parse_wetest_api_payload "$api_content" "$paired_data_file" "$expected_version"; then
-            return 0
+        # Public pages work without an API account. Use the API only when the
+        # caller supplied their own key; never ship a shared embedded token.
+        if [ -n "$api_key" ]; then
+            echo -e "  -> 正在获取 ${type_desc} API 列表..."
+            api_content=$(fetch_candidate_source --get \
+                --data-urlencode "key=${api_key}" \
+                --data-urlencode "type=${api_type}" \
+                "$api_url" 2>/dev/null || true)
+            if [ -n "$api_content" ] && \
+               parse_wetest_api_payload "$api_content" "$paired_data_file" "$expected_version"; then
+                return 0
+            fi
+            echo -e "${YELLOW}  -> ${type_desc} API 暂不可用，改用公开网页。${NC}"
         fi
-
-        echo -e "${YELLOW}  -> ${type_desc} API unavailable or invalid; trying the page fallback.${NC}"
-        parse_html_url "$html_url" "${type_desc} fallback" "$expected_version"
+        parse_html_url "$html_url" "$type_desc" "$expected_version"
     }
 
     if [ "$IP_VERSION_SCOPE" != ipv6 ]; then
@@ -1718,6 +1733,7 @@ get_vless_ps() {
 
 url_decode() {
     local value="${1//+/ }"
+    value=${value//\\/\\\\}
     printf '%b' "${value//%/\\x}"
 }
 
@@ -1776,8 +1792,6 @@ get_edge_ip_version() {
 
 resolve_ip_version_scope() {
     local requested_scope="${1:-}"
-    local has_ipv4="${2:-0}"
-    local has_ipv6="${3:-0}"
 
     case "$requested_scope" in
         ipv4|IPv4|4) printf '%s\n' "ipv4"; return 0 ;;
@@ -1785,39 +1799,14 @@ resolve_ip_version_scope() {
         both|BOTH|all|ALL|dual|DUAL|46|ipv4+ipv6|IPv4+IPv6) printf '%s\n' "both"; return 0 ;;
     esac
 
-    if [ "$has_ipv4" = "1" ] && [ "$has_ipv6" = "1" ]; then
-        printf '%s\n' "both"
-    elif [ "$has_ipv6" = "1" ]; then
-        printf '%s\n' "ipv6"
-    else
-        printf '%s\n' "ipv4"
-    fi
+    printf '%s\n' "both"
 }
 
 choose_ip_version_scope() {
-    local has_ipv4=0 has_ipv6=0
-
-    case "${CFY_IP_VERSION_SCOPE}" in
-        ipv4|IPv4|4|ipv6|IPv6|6|both|BOTH|all|ALL|dual|DUAL|46|ipv4+ipv6|IPv4+IPv6)
-            IP_VERSION_SCOPE=$(resolve_ip_version_scope "$CFY_IP_VERSION_SCOPE" 0 0)
-            echo -e "${GREEN}Using requested IP stack scope: ${IP_VERSION_SCOPE}.${NC}"
-            return 0
-            ;;
-    esac
-
-    if curl -4 -fsS --connect-timeout 2 --max-time 3 -o /dev/null https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null; then
-        has_ipv4=1
-    fi
-    if curl -6 -fsS --connect-timeout 2 --max-time 3 -o /dev/null https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null; then
-        has_ipv6=1
-    fi
-
-    IP_VERSION_SCOPE=$(resolve_ip_version_scope "" "$has_ipv4" "$has_ipv6")
-    if [ "$has_ipv4" = "0" ] && [ "$has_ipv6" = "0" ]; then
-        echo -e "${YELLOW}Could not verify either IP stack; falling back to IPv4 candidates.${NC}"
-    else
-        echo -e "${GREEN}检测到 VPS 地址族： ${IP_VERSION_SCOPE}.${NC}"
-    fi
+    # Generated nodes are used by clients, whose connectivity can differ from
+    # this VPS. Do not make outbound probes or infer the client's IP family.
+    IP_VERSION_SCOPE=$(resolve_ip_version_scope "${CFY_IP_VERSION_SCOPE:-}")
+    echo -e "${GREEN}入口地址范围：${IP_VERSION_SCOPE}。${NC}"
 }
 
 should_include_ip_version() {
@@ -1861,6 +1850,8 @@ valid_template_hostname() {
 
 normalize_vless_template() {
     local url="$1" host sni server path flow core fragment authority userinfo port
+    local query pair key rewritten='' seen_host=0 seen_sni=0
+    local -a pairs=()
     [[ "$url" == vless://*'@'*'?'* ]] || return 1
     core=${url%%#*}
     [[ "$core" != *$'\r'* && "$core" != *$'\n'* && "$core" != *$'\t'* && "$core" != *' '* ]] || return 1
@@ -1888,9 +1879,24 @@ normalize_vless_template() {
     [[ "$path" != *$'\r'* && "$path" != *$'\n'* ]] || return 1
     core=${url%%#*}; fragment=''
     [[ "$url" != *'#'* ]] || fragment="#${url#*#}"
-    [ -n "$(get_vless_query_param "$url" host || true)" ] || core+="&host=$(url_encode_fragment "$host")"
-    [ -n "$(get_vless_query_param "$url" sni || true)" ] || core+="&sni=$(url_encode_fragment "$sni")"
-    printf '%s%s\n' "$core" "$fragment"
+    query=${core#*\?}
+    IFS='&' read -r -a pairs <<< "$query"
+    for pair in "${pairs[@]}"; do
+        key=${pair%%=*}
+        case "$key" in
+            host)
+                [ "$seen_host" = 0 ] || continue
+                pair="host=$(url_encode_fragment "$host")"; seen_host=1 ;;
+            sni)
+                [ "$seen_sni" = 0 ] || continue
+                pair="sni=$(url_encode_fragment "$sni")"; seen_sni=1 ;;
+        esac
+        [ -z "$rewritten" ] || rewritten+='&'
+        rewritten+="$pair"
+    done
+    [ "$seen_host" = 1 ] || rewritten+="&host=$(url_encode_fragment "$host")"
+    [ "$seen_sni" = 1 ] || rewritten+="&sni=$(url_encode_fragment "$sni")"
+    printf '%s?%s%s\n' "${core%%\?*}" "$rewritten" "$fragment"
 }
 
 is_vless_ws_tls() {
@@ -1983,11 +1989,11 @@ show_source_templates() {
 
     load_source_urls || return 1
     [ ${#urls[@]} -gt 0 ] || return 1
-    echo -e "${GREEN}=== 已有 VLESS-WS-TLS 模板节点 ===${NC}"
+    echo -e "${GREEN}=== 已有 WS+TLS 模板节点 ===${NC}"
 
     for line in "${urls[@]}"; do
         [ -z "$line" ] && continue
-        if is_vless_ws_tls "$line"; then
+        if is_vless_ws_tls "$line" || normalize_vmess_template "$line" >/dev/null 2>&1; then
             echo "$line"
             found=1
         fi
@@ -2379,16 +2385,13 @@ load_edge_candidates_from_file() {
         [[ -z "${seen[$line]+x}" ]] || continue
         seen[$line]=1
         ip_list+=("$line"); isp_list+=(local)
-        [ "${#ip_list[@]}" -lt 30 ] || break
     done < "$file"
     [ "${#ip_list[@]}" -gt 0 ] || { printf '入口文件没有有效候选。\n' >&2; return 1; }
-    printf '已读取 %s 个本地入口（每次最多 30 个）。\n' "${#ip_list[@]}"
+    printf '已读取 %s 个本地入口。\n' "${#ip_list[@]}"
 }
 
 screen_edge_candidates() {
-    [ "${CFY_HEALTH_PROBE:-1}" != 0 ] || {
-        printf '本次未检查握手，生成结果需在客户端验证。\n' >&2; return 0;
-    }
+    [ "${CFY_HEALTH_PROBE:-0}" != 0 ] || return 0
     local indices index total=${#ip_list[@]} index_file screen_pid screen_rc=0 old_signals
     local -a kept_ips=() kept_isps=()
     index_file=$(mktemp) || return 1
@@ -2445,7 +2448,7 @@ update_vmess_url() {
     local modified_json new_base64 port
     port=$(printf '%s' "$original_json" | jq -r '.port // "443"') || return 1
     normalize_edge_input "$new_add" "$port"
-    modified_json=$(echo "$original_json" | jq --arg new_add "$EDGE_HOST" --arg new_port "$EDGE_PORT" --arg new_ps "$new_ps" '.add = $new_add | .port = $new_port | .ps = $new_ps | del(.allowInsecure)') || return 1
+    modified_json=$(echo "$original_json" | jq --arg new_add "$EDGE_HOST" --arg new_port "$EDGE_PORT" --arg new_ps "$new_ps" '.add = $new_add | .port = $new_port | .ps = $new_ps') || return 1
     new_base64=$(echo -n "$modified_json" | base64 | tr -d '\n')
     echo "vmess://${new_base64}"
 }
@@ -2454,30 +2457,26 @@ cidr_to_usable_ip() {
     local cidr="$1"
     local ip="${cidr%/*}"
     local prefix="${cidr#*/}"
-
+    local a b c d address mask network offset random_value
+    is_valid_ipv4_literal "$ip" || return 1
     if [[ "$cidr" != */* ]]; then
-        echo "$cidr"
-        return
+        printf '%s\n' "$ip"
+        return 0
     fi
-
-    if [[ "$ip" == *:* ]]; then
-        echo "$ip"
-        return
-    fi
-
-    local a b c d
+    [[ "$prefix" =~ ^[0-9]{1,2}$ ]] && [ "$((10#$prefix))" -le 32 ] || return 1
+    prefix=$((10#$prefix))
     IFS=. read -r a b c d <<< "$ip"
-    if [[ ! "$a$b$c$d$prefix" =~ ^[0-9]+$ ]] || [ "$prefix" -ge 31 ]; then
-        echo "$ip"
-        return
+    address=$(( (10#$a << 24) | (10#$b << 16) | (10#$c << 8) | 10#$d ))
+    mask=$(( (1 << (32-prefix)) - 1 ))
+    network=$(( address & (0xffffffff ^ mask) ))
+    random_value=$(( ((RANDOM << 17) ^ (RANDOM << 2) ^ (RANDOM & 3)) & 0xffffffff ))
+    if [ "$prefix" -lt 31 ]; then
+        offset=$(( random_value % (mask-1) + 1 ))
+    else
+        offset=$(( random_value & mask ))
     fi
-
-    d=$((d + 1))
-    if [ "$d" -gt 255 ]; then
-        d=1
-        c=$((c + 1))
-    fi
-    echo "${a}.${b}.${c}.${d}"
+    address=$(( network + offset ))
+    printf '%s.%s.%s.%s\n' "$(( (address >> 24) & 255 ))" "$(( (address >> 16) & 255 ))" "$(( (address >> 8) & 255 ))" "$(( address & 255 ))"
 }
 
 select_vless_template() {
@@ -2596,7 +2595,7 @@ main() {
     echo -e "${GREEN}已选择: $original_ps${NC}"
 
     local ip_source_choice; local use_optimized_ips=false use_custom_edges=false
-    local IP_VERSION_SCOPE="ipv4"
+    local IP_VERSION_SCOPE="both"
     declare -a ip_list isp_list; local num_to_generate=0
     if [ -n "${CFY_EDGE_FILE:-}" ]; then
         load_edge_candidates_from_file "$CFY_EDGE_FILE" || return 1
@@ -2604,7 +2603,7 @@ main() {
     else
         while true; do
             echo '请选择入口来源（回车使用云优选）：'
-            echo '  1) Cloudflare 官方网段候选（非测速优选）'
+            echo '  1) Cloudflare 官方网段（随机生成）'
             echo '  2) 云优选'
             echo '  3) 本地 IP 文件（无需等待云数据源）'
             echo '  0) 取消'
@@ -2633,9 +2632,10 @@ main() {
                     mapfile -t ip_list <<< "$cloudflare_ips"
                     echo "取得 ${#ip_list[@]} 个 Cloudflare IPv4 地址段。"
                     while true; do
-                        read -r -p '请输入候选检查数量 (1-30): ' num_to_generate || return 1
-                        if [[ "$num_to_generate" =~ ^[0-9]{1,2}$ ]] && [ "$num_to_generate" -gt 0 ] && [ "$num_to_generate" -le 30 ]; then break; fi
-                        echo '请输入 1-30 的正整数。' >&2
+                        read -r -p '请输入生成数量（默认 10）: ' num_to_generate || return 1
+                        num_to_generate=${num_to_generate:-10}
+                        if [[ "$num_to_generate" =~ ^[1-9][0-9]{0,8}$ ]]; then break; fi
+                        echo '请输入有效的正整数。' >&2
                     done
                     break
                     ;;
@@ -2645,14 +2645,15 @@ main() {
 
     fi
 
-    # Prepare once, then check a bounded batch instead of blocking per URL.
+    # Prepare once; optional VPS checks are separate from candidate generation.
     if ! $use_optimized_ips && ! $use_custom_edges; then
         local -A seen_candidates=()
         local -a ranges=("${ip_list[@]}") candidates=()
-        local range candidate
-        for ((i=0; i<num_to_generate; i++)); do
+        local range candidate attempts=0 max_attempts=$((num_to_generate * 4 + 32))
+        while [ "${#candidates[@]}" -lt "$num_to_generate" ] && [ "$attempts" -lt "$max_attempts" ]; do
+            attempts=$((attempts + 1))
             range=${ranges[$((RANDOM % ${#ranges[@]}))]}
-            candidate=$(cidr_to_usable_ip "$range") || return 1
+            candidate=$(cidr_to_usable_ip "$range") || { echo '官方列表包含无效网段，未更新结果。' >&2; return 1; }
             [[ -z "${seen_candidates[$candidate]+x}" ]] || continue
             seen_candidates[$candidate]=1
             candidates+=("$candidate")
@@ -2660,7 +2661,6 @@ main() {
         ip_list=("${candidates[@]}"); isp_list=()
     fi
     screen_edge_candidates "$selected_type" "$selected_url" || return 1
-    echo '本机握手检查不等于客户端可用；实际速度与代理认证请在客户端验证。'
     echo '---'; echo '生成的新节点链接如下：'
     local current_ip isp_group ip_version name_key new_ps generated_url name_prefix
     local -A name_counts=()
@@ -2687,7 +2687,7 @@ main() {
     done
     num_to_generate=${#generated_urls[@]}
     if [ "$num_to_generate" -eq 0 ]; then
-        echo -e "${RED}没有通过检查的节点，保留原订阅。${NC}" >&2
+        echo -e "${RED}没有可生成的节点，保留原订阅。${NC}" >&2
         return 1
     fi
     finalize_generated_urls "$num_to_generate" || return $?

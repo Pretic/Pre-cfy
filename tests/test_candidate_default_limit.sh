@@ -13,16 +13,16 @@ fi
 source <(printf '%s\n' "${function_source}")
 
 unset CFY_PER_ISP_LIMIT
-[[ "$(get_candidate_group_limit both)" == '3' ]] || {
-    echo 'FAIL: dual-stack limit must be 3 per ISP/family' >&2
+[[ "$(get_candidate_group_limit both)" == '0' ]] || {
+    echo 'FAIL: dual-stack candidates must be unlimited by default' >&2
     exit 1
 }
-[[ "$(get_candidate_group_limit ipv4)" == '5' ]] || {
-    echo 'FAIL: IPv4-only limit must be 5 per ISP' >&2
+[[ "$(get_candidate_group_limit ipv4)" == '0' ]] || {
+    echo 'FAIL: IPv4 candidates must be unlimited by default' >&2
     exit 1
 }
-[[ "$(get_candidate_group_limit ipv6)" == '5' ]] || {
-    echo 'FAIL: IPv6-only limit must be 5 per ISP' >&2
+[[ "$(get_candidate_group_limit ipv6)" == '0' ]] || {
+    echo 'FAIL: IPv6 candidates must be unlimited by default' >&2
     exit 1
 }
 
@@ -32,4 +32,6 @@ CFY_PER_ISP_LIMIT=4
     exit 1
 }
 
-echo 'Candidate stack-aware limit tests passed.'
+CFY_PER_ISP_LIMIT=0
+[[ "$(get_candidate_group_limit both)" == 0 ]]
+echo 'Default unlimited candidates and explicit group-limit tests passed.'

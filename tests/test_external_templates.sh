@@ -14,10 +14,18 @@ normalized=$(normalize_vless_template "$v")
 [[ "$(get_vless_query_param "$normalized" path)" == '/socket?ed=2048' ]]
 [[ "$(normalize_vless_template "$normalized")" == "$normalized" ]]
 [[ "$(normalize_vless_template "${v%#*}#two words")" == *'#two words' ]]
+# Explicit empty keys must be replaced, not duplicated after the empty value.
+empty_normalized=$(normalize_vless_template "${v%#*}&host=&sni=&ed=2048#empty")
+[[ "$(get_vless_query_param "$empty_normalized" host)" == cdn.example.com ]]
+[[ "$(get_vless_query_param "$empty_normalized" sni)" == cdn.example.com ]]
+[[ "$(get_vless_query_param "$empty_normalized" ed)" == 2048 ]]
+[[ "$(normalize_vless_template "$empty_normalized")" == "$empty_normalized" ]]
+[[ $(grep -o '&host=' <<< "$empty_normalized" | wc -l) == 1 ]]
+[[ $(grep -o '&sni=' <<< "$empty_normalized" | wc -l) == 1 ]]
 for bad in "${v/security=tls/security=reality}" "${v/type=ws/type=tcp}" "${v/&path=/&flow=xtls-rprx-vision&path=}" 'vless://id@1.2.3.4:443?security=tls&type=ws'; do
  if normalize_vless_template "$bad" >/dev/null 2>&1; then echo 'accepted incompatible VLESS'; exit 1; fi
 done
-j='{"v":"2","ps":"external-vmess","add":"workers.example.com","port":"443","id":"00000000-0000-4000-8000-000000000002","aid":"0","net":"ws","tls":"tls","path":"/socket?ed=2048","alpn":"http/1.1","fp":"chrome"}'
+j='{"v":"2","ps":"external-vmess","add":"workers.example.com","port":"443","id":"00000000-0000-4000-8000-000000000002","aid":"0","net":"ws","tls":"tls","path":"/socket?ed=2048","alpn":"http/1.1","fp":"chrome","allowInsecure":true}'
 m="vmess://$(printf '%s' "$j" | base64 | tr -d '\n')"
 mj=$(normalize_vmess_template "$m")
 jq -e '.host=="workers.example.com" and .sni=="workers.example.com" and .fp=="chrome"' <<< "$mj" >/dev/null
@@ -33,7 +41,7 @@ select_vless_template; select_vmess_template
 [[ ${#valid_urls[@]} == 2 && "${valid_types[*]}" == 'vless vmess' ]]
 updated=$(update_vmess_url "$mj" '[2606:4700::1111]:8443' candidate)
 uj=$(decode_vmess_template "$updated")
-jq -e '.add=="2606:4700::1111" and .port=="8443" and .host=="workers.example.com" and .sni=="workers.example.com" and .path=="/socket?ed=2048" and .fp=="chrome"' <<< "$uj" >/dev/null
+jq -e '.add=="2606:4700::1111" and .port=="8443" and .host=="workers.example.com" and .sni=="workers.example.com" and .path=="/socket?ed=2048" and .fp=="chrome" and .allowInsecure==true' <<< "$uj" >/dev/null
 probe_vless_edge_candidate() {
  [[ "$(get_vless_query_param "$1" host)" == workers.example.com ]]
  [[ "$(get_vless_query_param "$1" path)" == '/socket?ed=2048' ]]

@@ -29,7 +29,7 @@ HTML
 }
 
 get_all_optimized_ips >/dev/null || { echo 'FAIL: current WeTest HTML fallback rejected valid Chinese millisecond RTTs' >&2; exit 1; }
-[[ "${ip_list[*]}" == '104.17.99.98 104.17.218.101 2606:4700:9ae9::7de7:a165' ]] || {
-    echo 'FAIL: HTML fallback lost valid candidates or accepted invalid RTTs' >&2; exit 1;
+[[ "${ip_list[*]}" == '104.17.99.98 104.17.218.101 104.17.0.1 104.17.0.2 2606:4700:9ae9::7de7:a165' ]] || {
+    echo 'FAIL: HTML source discarded valid IPs because of their RTT fields' >&2; exit 1;
 }
-echo 'Chinese millisecond HTML fallback tests passed.'
+echo 'Chinese millisecond HTML parsing and unknown RTT preservation tests passed.'
