@@ -1937,6 +1937,7 @@ read_manual_template() {
     while true; do
         read -r -s -p '粘贴 VLESS/VMess WS+TLS 链接（不回显）: ' value || return 1
         printf '\n' >&2
+        value=$(normalize_url_candidate "$value") || value=''
         if [[ "$value" == vless://* ]] && normalized=$(normalize_vless_template "$value"); then
             MANUAL_TEMPLATE=$normalized; return 0
         elif [[ "$value" == vmess://* ]] && json=$(normalize_vmess_template "$value"); then
